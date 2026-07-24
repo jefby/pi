@@ -200,23 +200,23 @@ main.ts
 sequenceDiagram
     participant Session as AgentSession
     participant Agent as Agent (pi-agent-core)
-    participant Loop as agentLoop()
+    participant LoopRunner as agentLoop()
     participant LLM as LLM 流
     participant Tools as 工具执行
 
     Session->>Agent: agent.prompt(messages, images)
-    Agent->>Loop: runAgentLoop()
-    Loop->>Loop: 追加 prompt 到上下文
-    Loop->>LLM: streamAssistantResponse()
-    LLM-->>Loop: message_start / message_update / message_end
-    Loop->>Loop: 若包含 toolCall
-    Loop->>Tools: executeToolCalls()
-    Tools-->>Loop: toolResult 消息
-    Loop->>Loop: prepareNextTurn()
+    Agent->>LoopRunner: runAgentLoop()
+    LoopRunner->>LoopRunner: 追加 prompt 到上下文
+    LoopRunner->>LLM: streamAssistantResponse()
+    LLM-->>LoopRunner: message_start / message_update / message_end
+    LoopRunner->>LoopRunner: 若包含 toolCall
+    LoopRunner->>Tools: executeToolCalls()
+    Tools-->>LoopRunner: toolResult 消息
+    LoopRunner->>LoopRunner: prepareNextTurn()
     alt 还有 steering/followUp 消息
-        Loop->>Loop: 继续内层循环
+        LoopRunner->>LoopRunner: 继续内层循环
     else 需要停止
-        Loop-->>Agent: turn_end / agent_end
+        LoopRunner-->>Agent: turn_end / agent_end
     end
     Agent-->>Session: 事件流
 ```
