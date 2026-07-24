@@ -253,7 +253,7 @@ flowchart LR
     API[api/openai-responses.ts<br/>api/anthropic-messages.ts<br/>api/pi-messages.ts ...]
     Upstream[上游 LLM]
 
-    Caller -->|stream(model, context, options)| Models
+    Caller -->|"stream(model, context, options)"| Models
     Models -->|requireProvider| Provider
     Models -->|applyAuth| Auth
     Auth -->|read/refresh| Store
