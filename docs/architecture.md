@@ -1,12 +1,15 @@
 # Pi 软件流程架构分析
 
-> 分析范围：Pi monorepo 五个工作区（`packages/orchestrator`、`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`）以及它们之间的调用与数据流。
+> 分析范围：Pi monorepo 七个工作区（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/server`、`packages/evals`、`packages/storage/sqlite-node`）以及它们之间的调用与数据流。
 
 ## 目录
 
 - [1. 概览](#1-概览)
 - [2. 包架构分层](#2-包架构分层)
 - [3. 入口与运行模式](#3-入口与运行模式)
+  - [3.1 CLI 入口](#31-cli-入口)
+  - [3.2 运行模式](#32-运行模式)
+  - [3.3 模式数据流](#33-模式数据流)
 - [4. 核心流程](#4-核心流程)
   - [4.1 CLI 解析与会话解析](#41-cli-解析与会话解析)
   - [4.2 AgentSession 构造](#42-agentsession-构造)
@@ -15,9 +18,13 @@
   - [4.5 工具执行](#45-工具执行)
   - [4.6 交互式渲染与 TUI](#46-交互式渲染与-tui)
   - [4.7 上下文压缩](#47-上下文压缩)
-- [5. Orchestrator 多实例架构](#5-orchestrator-多实例架构)
-- [6. 数据持久化](#6-数据持久化)
-- [7. 关键文件索引](#7-关键文件索引)
+  - [4.8 会话存储抽象](#48-会话存储抽象)
+  - [4.9 Skills 与提示模板](#49-skills-与提示模板)
+  - [4.10 HTML 会话导出](#410-html-会话导出)
+- [5. Server 多实例架构](#5-server-多实例架构)
+- [6. Evals 评测框架](#6-evals-评测框架)
+- [7. 数据持久化](#7-数据持久化)
+- [8. 关键文件索引](#8-关键文件索引)
 
 ---
 
@@ -25,26 +32,31 @@
 
 Pi 是一个模块化、分层设计的 AI 编程助手运行时：
 
-- **`packages/orchestrator`**：可选的本地守护进程，管理多个 `pi-coding-agent` 子进程，通过 Unix Domain Socket 暴露 JSONL IPC。
-- **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）。
-- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、工具调度、状态管理和上下文压缩。
+- **`packages/server`**：可选的本地守护进程，管理多个 `pi-coding-agent` 子进程，通过 Unix Domain Socket 暴露 JSONL IPC；可选注册到 Radius 中继。
+- **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）、Skills、HTML 导出。
+- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、工具调度、状态管理、上下文压缩、可插拔会话存储与执行环境抽象。
 - **`packages/ai`**：统一多提供商 LLM API，封装 OpenAI、Anthropic、Google、Bedrock、Mistral 等协议。
 - **`packages/tui`**：终端 UI 库，提供差分渲染、组件树、键盘输入、编辑器和覆盖层。
+- **`packages/evals`**：内部行为评测包，基于 `vitest-evals` 对 coding-agent 进行端到端评测。
+- **`packages/storage/sqlite-node`**：`pi-agent-core` 的可选 SQLite 会话存储后端，基于 `node:sqlite`。
 
 整体数据流向：
 
 ```mermaid
 flowchart LR
     User[用户/外部客户端]
-    Orchestrator[orchestrator.sock<br/>JSONL IPC]
+    Server[server.sock<br/>JSONL IPC]
     CodingAgent[pi-coding-agent]
     Agent[Agent 运行时]
     AI[pi-ai 提供商层]
     LLM[上游 LLM API]
     TUI[pi-tui 终端 UI]
     Tools[文件/Shell 工具]
+    Evals[pi-evals]
+    Storage[(SQLite / JSONL)]
 
     User -->|cli / rpc| CodingAgent
+    Server -->|spawn/rpc| CodingAgent
     CodingAgent -->|spawn| Agent
     Agent -->|stream| AI
     AI -->|HTTP/SSE| LLM
@@ -53,6 +65,8 @@ flowchart LR
     Agent -->|events| CodingAgent
     CodingAgent -->|render| TUI
     CodingAgent -->|execute| Tools
+    CodingAgent -->|read/write| Storage
+    Evals -->|harness| CodingAgent
 ```
 
 ---
@@ -61,42 +75,54 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph Layer5["外部入口层"]
-        OrchestratorPkg["@earendil-works/pi-orchestrator"]
+    subgraph Layer7["外部入口层"]
+        ServerPkg["@earendil-works/pi-server"]
         CodingAgentCli["pi CLI (packages/coding-agent/dist/cli.js)"]
     end
 
-    subgraph Layer4["应用/SDK 层"]
+    subgraph Layer6["应用/SDK 层"]
         CodingAgent["@earendil-works/pi-coding-agent"]
     end
 
-    subgraph Layer3["Agent 运行时层"]
+    subgraph Layer5["Agent 运行时层"]
         AgentCore["@earendil-works/pi-agent-core"]
     end
 
-    subgraph Layer2["LLM 抽象层"]
+    subgraph Layer4["LLM 抽象层"]
         AI["@earendil-works/pi-ai"]
     end
 
-    subgraph Layer1["终端 UI 层"]
+    subgraph Layer3["终端 UI 层"]
         TUI["@earendil-works/pi-tui"]
     end
 
-    OrchestratorPkg -->|spawn/rpc| CodingAgent
+    subgraph Layer2["可选持久化层"]
+        Storage["@earendil-works/pi-storage-sqlite-node"]
+    end
+
+    subgraph Layer1["评测层"]
+        Evals["@earendil-works/pi-evals"]
+    end
+
+    ServerPkg -->|spawn/rpc| CodingAgent
     CodingAgentCli --> CodingAgent
     CodingAgent --> AgentCore
     CodingAgent --> TUI
     AgentCore --> AI
+    AgentCore -.->|SessionStorage| Storage
+    Evals -->|harness| CodingAgent
 ```
 
 | 层级 | 包 | 主要职责 |
 |------|------|----------|
-| 外部入口 | `pi-orchestrator` | 多实例守护、进程监管、RPC 桥接、Radius 中继 |
+| 外部入口 | `pi-server` | 多实例守护、进程监管、RPC 桥接、Radius 中继 |
 | 外部入口 | `pi-coding-agent` CLI | 参数解析、模式分发、主函数入口 |
-| 应用/SDK | `pi-coding-agent` | 会话管理、扩展、工具、模式实现、配置 |
-| Agent 运行时 | `pi-agent-core` | 多轮循环、消息队列、工具调度、压缩、持久化抽象 |
+| 应用/SDK | `pi-coding-agent` | 会话管理、扩展、工具、模式实现、配置、Skills、导出 |
+| Agent 运行时 | `pi-agent-core` | 多轮循环、消息队列、工具调度、压缩、持久化抽象、执行环境抽象 |
 | LLM 抽象 | `pi-ai` | 提供商注册、认证、流式请求、协议转换 |
 | 终端 UI | `pi-tui` | 差分渲染、组件、输入、编辑器、覆盖层 |
+| 可选持久化 | `pi-storage-sqlite-node` | SQLite 会话后端、迁移、物化状态 |
+| 评测 | `pi-evals` | 基于 `vitest-evals` 的端到端行为评测 |
 
 ---
 
@@ -104,9 +130,10 @@ flowchart TB
 
 ### 3.1 CLI 入口
 
-- **Node 入口**：`packages/coding-agent/src/cli.ts` → `dist/cli.js`（`bin.pi`）。
+- **Node 入口**：`packages/coding-agent/src/cli.ts` → `dist/cli.js`（`bin "pi"`）。
 - **Bun 二进制入口**：编译后的 `dist/pi` 同样进入 `cli.ts`。
-- **Orchestrator 入口**：`packages/orchestrator/src/cli.ts` → `serve` / `spawn` / `rpc` 等子命令。
+- **Server 入口**：`packages/server/src/cli.ts` → `serve` / `spawn` / `rpc` / `rpc-stream` / `list` / `status` / `stop` 等子命令。
+- **Evals 入口**：根目录 `npm run eval -- --provider <p> --model <m>`，内部调用 `packages/evals/scripts/run-evals.mjs`。
 
 ### 3.2 运行模式
 
@@ -184,9 +211,10 @@ main.ts
 `AgentSession` 是 `coding-agent` 的核心抽象，职责包括：
 
 - 管理 `Agent` 实例、扩展运行时、会话持久化。
-- 提供 `prompt()`、`steer()`、`followUp()`、`abort()`、`compact()`。
+- 提供 `prompt()`、`steer()`、`followUp()`、`abort()`、`compact()`、`reload()`、`dispose()`。
 - 处理 slash 命令（`/new`、`/fork`、`/model`、`/compact` 等）。
 - 在 `agent_start` / `message_end` / `turn_end` 等事件点上持久化会话。
+- 支持 `Skill` 块解析与注入、提示模板展开、HTML 导出。
 
 ### 4.3 Agent 循环
 
@@ -364,6 +392,7 @@ flowchart TB
 **文件**：
 
 - `packages/agent/src/harness/compaction/compaction.ts`
+- `packages/agent/src/harness/compaction/branch-summarization.ts`
 - `packages/agent/src/harness/session/session.ts`
 - `packages/coding-agent/src/core/compaction/index.ts`
 
@@ -380,29 +409,94 @@ flowchart TB
 3. `session.appendCompaction()` 写入 `compaction` 条目。
 4. 后续 `Session.buildContext()` 自动将压缩点之前的条目替换为摘要条目，从而缩小上下文。
 
----
-
-## 5. Orchestrator 多实例架构
+### 4.8 会话存储抽象
 
 **文件**：
 
-- `packages/orchestrator/src/serve.ts`
-- `packages/orchestrator/src/supervisor.ts`
-- `packages/orchestrator/src/rpc-process.ts`
-- `packages/orchestrator/src/ipc/server.ts`、`ipc/client.ts`、`ipc/protocol.ts`
+- `packages/agent/src/harness/types.ts`
+- `packages/agent/src/harness/session/session.ts`
+- `packages/agent/src/harness/session/jsonl-repo.ts`、`jsonl-storage.ts`
+- `packages/agent/src/harness/session/memory-repo.ts`、`memory-storage.ts`
+- `packages/storage/sqlite-node/src/sqlite/repo.ts`、`storage/index.ts`
+
+`pi-agent-core` 将会话持久化抽象为 `SessionStorage` 接口：
+
+| 后端 | 实现 | 说明 |
+|------|------|------|
+| JSONL | `JsonlSessionStorage` / `JsonlSessionRepo` | 默认后端，每个会话一个 `.jsonl` 文件，兼容旧格式 |
+| Memory | `MemorySessionStorage` / `MemorySessionRepo` | 内存中，测试/评测使用 |
+| SQLite | `SqliteSessionStorage` / `SqliteSessionRepo` | 可选后端，基于 `node:sqlite`，支持分支物化与迁移 |
+
+`SessionStorage` 职责：
+
+- 追加 `SessionTreeEntry`（消息、模型变更、压缩、分支摘要、自定义条目等）。
+- 维护当前 `leafId` 与会话树分支。
+- 提供 `getPathToRootOrCompaction()` 构建模型上下文。
+- 物化会话统计（token、工具调用数）与标签。
+
+`coding-agent` 当前默认仍使用 JSONL 的 `SessionManager`（在 `packages/coding-agent/src/core/session-manager.ts` 中），该管理器内部实现与 `pi-agent-core` 的抽象并行演进；`pi-storage-sqlite-node` 则为需要 SQLite 后端的调用方提供即插即用实现。
+
+### 4.9 Skills 与提示模板
+
+**文件**：
+
+- `packages/coding-agent/src/core/skills.ts`
+- `packages/coding-agent/src/core/prompt-templates.ts`
+- `packages/coding-agent/src/core/system-prompt.ts`
+- `packages/agent/src/harness/skills.ts`
+- `packages/agent/src/harness/prompt-templates.ts`
+
+Skills：
+
+- 从 `.pi/skills/`、项目 `.skills/` 或显式路径加载 `SKILL.md` 文件。
+- 解析 YAML frontmatter（`name`、`description`、`disable-model-invocation`）。
+- 以 XML 块形式注入系统提示词，供模型参考。
+- 用户可在输入中使用 `<skill name="..." location="...">...</skill>` 块显式调用。
+
+提示模板：
+
+- 从 `.pi/prompts/` 或项目 `.prompts/` 加载模板。
+- 支持参数插值，通过 slash 命令或显式调用展开为 prompt。
+
+### 4.10 HTML 会话导出
+
+**文件**：
+
+- `packages/coding-agent/src/core/export-html/index.ts`
+- `packages/coding-agent/src/core/export-html/tool-renderer.ts`
+- `packages/coding-agent/src/core/export-html/template.html`
+
+功能：
+
+- 将 JSONL 会话文件渲染为独立 HTML 页面。
+- 使用当前主题配色，支持 ANSI 转 HTML、代码高亮、Markdown 渲染。
+- 扩展可提供 `ToolHtmlRenderer` 自定义工具输出渲染。
+- 交互式模式通过 `/export` 或 `--export` 参数触发。
+
+---
+
+## 5. Server 多实例架构
+
+**文件**：
+
+- `packages/server/src/serve.ts`
+- `packages/server/src/supervisor.ts`
+- `packages/server/src/rpc-process.ts`
+- `packages/server/src/handler.ts`
+- `packages/server/src/ipc/server.ts`、`ipc/client.ts`、`ipc/protocol.ts`
 
 ```mermaid
 flowchart TB
     subgraph Client["外部客户端"]
-        Cli[orchestrator cli]
+        Cli[server cli]
         Radius[Radius 中继]
     end
 
-    subgraph Daemon["orchestrator 守护进程"]
-        Socket[orchestrator.sock]
+    subgraph Daemon["server 守护进程"]
+        Socket[server.sock]
         Server[ipc/server.ts]
         Handler[handler.ts]
-        Supervisor[OrchestratorSupervisor]
+        Supervisor[ServerSupervisor]
         RpcProcess[RpcProcessInstance]
     end
 
@@ -426,21 +520,60 @@ flowchart TB
 2. `bindRpcProcess()`：将子进程 stdout 的 JSONL 事件转发给订阅者。
 3. `syncInstanceRecord()`：发送 `get_state` RPC，保存 `sessionId` / `sessionFile`。
 4. `radiusPresence.registerPi()`：可选注册到 Radius 中继。
-5. `rpc_stream`：客户端与 orchestrator 建立长连接，orchestrator 与子进程 stdin/stdout 桥接，实现双向 JSONL 流。
+5. `rpc_stream`：客户端与 server 建立长连接，server 与子进程 stdin/stdout 桥接，实现双向 JSONL 流。
 6. `stop`：清理订阅、断开 Radius、发送 SIGTERM、更新状态为 `stopped`。
+
+CLI 命令：
+
+```bash
+server serve
+server list
+server spawn [--cwd <path>] [--label <label>]
+server status <instance-id>
+server stop <instance-id>
+server rpc <instance-id> <json-command>
+server rpc-stream <instance-id>
+```
 
 ---
 
-## 6. 数据持久化
+## 6. Evals 评测框架
+
+**文件**：
+
+- `packages/evals/src/pi-harness.ts`
+- `packages/evals/src/smoke.eval.ts`
+- `packages/evals/src/extensions.eval.ts`
+- `packages/evals/scripts/run-evals.mjs`
+
+`pi-evals` 是私有包，不发布到 npm，基于 `vitest-evals` 对 `pi-coding-agent` 进行端到端行为评测：
+
+1. `createPiCodingAgentHarness()` 创建隔离临时目录与 `AgentSession`。
+2. 通过 `PI_PROVIDER` / `PI_MODEL` 环境变量指定被测模型。
+3. 执行 prompt 步骤，收集 assistant 输出、工具调用、token 用量。
+4. 将结果归一化为 `TranscriptEvent` 与 usage 统计，供 `vitest-evals` 评分。
+
+运行方式：
+
+```bash
+npm run eval -- --provider <provider> --model <model>
+```
+
+---
+
+## 7. 数据持久化
 
 | 数据 | 位置 | 说明 |
 |------|------|------|
-| 会话历史 | `.pi/sessions/<id>.jsonl` | 树状结构的消息、模型变更、思考级别变更、压缩摘要 |
-| 设置 | `.pi/settings.json` | 用户偏好、模型、 Provider 凭证引用 |
+| 会话历史（JSONL） | `.pi/sessions/<id>.jsonl` | 树状结构的消息、模型变更、思考级别变更、压缩摘要 |
+| 会话历史（SQLite） | `<db-path>`（可配置） | 可选 `SqliteSessionRepo` 持久化，含 sessions / session_entries / branch_entries / session_materialized 等表 |
+| 设置 | `.pi/settings.json` | 用户偏好、模型、Provider 凭证引用 |
 | 凭证 | 系统密钥存储 / `.pi/credentials` | API key / OAuth token（由 `CredentialStore` 抽象） |
-| 模型缓存 | `~/.pi/models-store.json` | 各 Provider 的动态模型列表缓存 |
-| Orchestrator 实例 | `~/.pi/orchestrator/instances.json` | 实例元数据 |
-| Orchestrator 机器身份 | `~/.pi/orchestrator/machine.json` | Radius 注册信息 |
+| 模型缓存 | `~/.pi/agent/models-store.json` | 各 Provider 的动态模型列表缓存 |
+| Server IPC socket | `~/.pi/server/server.sock` | Unix Domain Socket 监听地址 |
+| Server 实例 | `~/.pi/server/instances.json` | 实例元数据 |
+| Server 机器身份 | `~/.pi/server/machine.json` | Radius 注册信息 |
+| Server 凭证 | `~/.pi/server/auth.json` | server 自身认证信息 |
 
 会话条目类型（`SessionTreeEntry`）：
 
@@ -457,19 +590,21 @@ flowchart TB
 
 ---
 
-## 7. 关键文件索引
+## 8. 关键文件索引
 
-### Orchestrator
+### Server
 
 | 文件 | 职责 |
 |------|------|
-| `packages/orchestrator/src/cli.ts` | orchestrator 命令行入口 |
-| `packages/orchestrator/src/serve.ts` | 守护进程启动、优雅退出 |
-| `packages/orchestrator/src/supervisor.ts` | 实例生命周期监管 |
-| `packages/orchestrator/src/rpc-process.ts` | Agent 子进程封装与 JSONL 通信 |
-| `packages/orchestrator/src/ipc/server.ts` | Unix socket 服务器、流升级 |
-| `packages/orchestrator/src/ipc/protocol.ts` | IPC 消息协议类型 |
-| `packages/orchestrator/src/radius.ts` | Radius 中继注册与心跳 |
+| `packages/server/src/cli.ts` | server 命令行入口 |
+| `packages/server/src/serve.ts` | 守护进程启动、优雅退出 |
+| `packages/server/src/supervisor.ts` | 实例生命周期监管 |
+| `packages/server/src/rpc-process.ts` | Agent 子进程封装与 JSONL 通信 |
+| `packages/server/src/handler.ts` | IPC 请求路由与 rpc_stream 升级 |
+| `packages/server/src/ipc/server.ts` | Unix socket 服务器、流升级 |
+| `packages/server/src/ipc/protocol.ts` | IPC 消息协议类型 |
+| `packages/server/src/radius.ts` | Radius 中继注册与心跳 |
+| `packages/server/src/storage.ts` | instances.json / machine.json 持久化 |
 
 ### Coding Agent
 
@@ -481,8 +616,12 @@ flowchart TB
 | `packages/coding-agent/src/core/agent-session-services.ts` | 按 cwd 构建服务 |
 | `packages/coding-agent/src/core/agent-session-runtime.ts` | 运行时与会话切换 |
 | `packages/coding-agent/src/core/agent-session.ts` | 核心会话抽象与事件流 |
+| `packages/coding-agent/src/core/session-manager.ts` | JSONL 会话管理 |
 | `packages/coding-agent/src/core/extensions/index.ts` | 扩展系统 |
 | `packages/coding-agent/src/core/tools/index.ts` | 内置工具工厂 |
+| `packages/coding-agent/src/core/skills.ts` | Skill 加载与解析 |
+| `packages/coding-agent/src/core/prompt-templates.ts` | 提示模板加载与展开 |
+| `packages/coding-agent/src/core/export-html/index.ts` | 会话 HTML 导出 |
 | `packages/coding-agent/src/modes/print-mode.ts` | 一次性文本/JSON 模式 |
 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | 交互式 TUI 模式 |
 | `packages/coding-agent/src/modes/rpc/` | RPC 模式 |
@@ -495,9 +634,15 @@ flowchart TB
 | `packages/agent/src/agent-loop.ts` | 多轮 LLM/工具循环 |
 | `packages/agent/src/types.ts` | 核心类型 |
 | `packages/agent/src/harness/agent-harness.ts` | 生产级 harness |
-| `packages/agent/src/harness/session/session.ts` | 树状会话存储抽象 |
+| `packages/agent/src/harness/types.ts` | harness 类型：FileSystem、ExecutionEnv、SessionStorage、Result |
+| `packages/agent/src/harness/session/session.ts` | 树状会话抽象与上下文构建 |
+| `packages/agent/src/harness/session/jsonl-repo.ts` | JSONL 会话仓库 |
+| `packages/agent/src/harness/session/memory-repo.ts` | 内存会话仓库 |
+| `packages/agent/src/harness/env/nodejs.ts` | Node.js 文件系统/Shell 执行环境实现 |
 | `packages/agent/src/harness/compaction/compaction.ts` | 上下文压缩 |
+| `packages/agent/src/harness/compaction/branch-summarization.ts` | 分支摘要 |
 | `packages/agent/src/harness/prompt-templates.ts` | 提示词模板加载 |
+| `packages/agent/src/node.ts` | Node 环境导出 |
 
 ### AI
 
@@ -528,16 +673,39 @@ flowchart TB
 | `packages/tui/src/components/select-list.ts` | 选择列表 |
 | `packages/tui/src/components/box.ts` | 带背景的容器 |
 
+### Storage (SQLite Node)
+
+| 文件 | 职责 |
+|------|------|
+| `packages/storage/sqlite-node/src/index.ts` | Node sqlite 适配器与后端导出 |
+| `packages/storage/sqlite-node/src/sqlite/repo.ts` | `SqliteSessionRepo`：create/open/list/delete/fork |
+| `packages/storage/sqlite-node/src/sqlite/storage/index.ts` | `SqliteSessionStorage`：SessionStorage 实现 |
+| `packages/storage/sqlite-node/src/sqlite/storage/session-entries.ts` | 会话条目编码/解码 |
+| `packages/storage/sqlite-node/src/sqlite/storage/branch-entries.ts` | 分支路径物化 |
+| `packages/storage/sqlite-node/src/sqlite/storage/session-materialized.ts` | 物化状态与统计 |
+| `packages/storage/sqlite-node/src/sqlite/migrations.ts` | 数据库迁移 |
+
+### Evals
+
+| 文件 | 职责 |
+|------|------|
+| `packages/evals/src/pi-harness.ts` | Pi coding-agent 的 vitest-evals harness |
+| `packages/evals/src/smoke.eval.ts` | 冒烟评测用例 |
+| `packages/evals/src/extensions.eval.ts` | 扩展系统评测用例 |
+| `packages/evals/scripts/run-evals.mjs` | 评测运行入口 |
+
 ---
 
 ## 总结
 
 Pi 的架构呈现清晰的纵向分层：
 
-1. **入口层**（CLI / Orchestrator）负责启动和外部连接。
-2. **应用层**（`coding-agent`）承载产品级语义：会话、扩展、工具、配置、UI。
-3. **运行时层**（`agent-core`）提供与产品无关的 Agent 循环、状态、压缩。
+1. **入口层**（CLI / Server）负责启动和外部连接。
+2. **应用层**（`coding-agent`）承载产品级语义：会话、扩展、工具、配置、UI、Skills、导出。
+3. **运行时层**（`agent-core`）提供与产品无关的 Agent 循环、状态、压缩、可插拔存储与执行环境抽象。
 4. **LLM 层**（`ai`）将多提供商差异收敛为统一的消息/事件/认证模型。
 5. **UI 层**（`tui`）提供高效差分渲染的终端组件系统。
+6. **持久化层**（`storage/sqlite-node`）提供可选的 SQLite 后端实现。
+7. **评测层**（`evals`）对 coding-agent 进行端到端行为评测。
 
 核心控制流是：用户输入 → `AgentSession.prompt()` → `Agent` 循环 → `Models.stream()` → 上游 LLM → 流式事件 → 工具执行 → 事件持久化 → UI/stdout 渲染。扩展和钩子机制贯穿整个流程，允许在输入、LLM 请求、工具调用、输出渲染等节点注入自定义行为。
