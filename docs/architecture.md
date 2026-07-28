@@ -57,7 +57,7 @@ flowchart LR
 
     User -->|cli / rpc| CodingAgent
     Server -->|spawn/rpc| CodingAgent
-    CodingAgent -->|new Agent()| Agent
+    CodingAgent -->|"new Agent()"| Agent
     Agent -->|stream| AI
     AI -->|HTTP/SSE| LLM
     LLM -->|stream| AI
