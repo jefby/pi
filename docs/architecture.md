@@ -34,7 +34,7 @@ Pi 是一个模块化、分层设计的 AI 编程助手运行时：
 
 - **`packages/server`**：可选的本地守护进程，管理多个 `pi-coding-agent` 子进程，通过 Unix Domain Socket 暴露 JSONL IPC；可选注册到 Radius 中继。
 - **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）、Skills、HTML 导出。
-- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、工具调度、状态管理、上下文压缩、可插拔会话存储与执行环境抽象。
+- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、消息队列（steer/followUp）、工具调度、状态管理。下层 `harness/` 目录提供生产级参考实现（SessionStorage、compaction、tools），但 `coding-agent` 有自己独立的同名实现。
 - **`packages/ai`**：统一多提供商 LLM API，封装 OpenAI、Anthropic、Google、Bedrock、Mistral 等协议。
 - **`packages/tui`**：终端 UI 库，提供差分渲染、组件树、键盘输入、编辑器和覆盖层。
 - **`packages/evals`**：内部行为评测包，基于 `vitest-evals` 对 coding-agent 进行端到端评测。
@@ -234,17 +234,18 @@ main.ts
 
 - `packages/agent/src/agent-loop.ts`：底层循环实现。
 - `packages/agent/src/agent.ts`：有状态包装器。
-- `packages/agent/src/harness/agent-harness.ts`：生产级 harness，连接会话、模型、工具、资源。
+
+`coding-agent` 不再使用 `AgentHarness`，而是由 `AgentSession` 直接包装 `Agent`（`@earendil-works/pi-agent-core`），通过事件订阅和钩子注入所有业务逻辑。
 
 ```mermaid
 sequenceDiagram
     participant Session as AgentSession
     participant Agent as Agent (pi-agent-core)
-    participant LoopRunner as agentLoop()
+    participant LoopRunner as runAgentLoop()
     participant LLM as LLM 流
     participant Tools as 工具执行
 
-    Session->>Agent: agent.prompt(messages, images)
+    Session->>Agent: agent.prompt(messages)
     Agent->>LoopRunner: runAgentLoop()
     LoopRunner->>LoopRunner: 追加 prompt 到上下文
     LoopRunner->>LLM: streamAssistantResponse()
@@ -258,23 +259,21 @@ sequenceDiagram
     else 需要停止
         LoopRunner-->>Agent: turn_end / agent_end
     end
-    Agent-->>Session: 事件流
+    Agent-->>Session: 事件流 (subscribe)
 ```
 
 `Agent` 包装器维护：
 
 - `_state`：系统提示词、模型、思考级别、消息历史、工具列表。
-- `steeringQueue` / `followUpQueue`：运行中/运行后注入用户消息。
+- `steeringQueue` / `followUpQueue`：运行中/运行后注入用户消息，drain 策略为 `one-at-a-time` 或 `all`。
 - `activeRun`：当前运行的 AbortController 和 Promise。
 
-`AgentHarness` 在 `Agent` 之上添加：
+`AgentSession` 通过四种方式与 `Agent` 交互：
 
-- 从 `Session` 构建上下文。
-- 工具前后钩子（`beforeToolCall` / `afterToolCall`）。
-- 内置通用工具实现（`packages/agent/src/harness/tools/*`：read、bash、edit、write、image、file-mutation-queue）。
-- 提供商请求前后钩子（`before_provider_request` / `after_provider_response`）。
-- 待写入缓冲（`pendingSessionWrites`）在 `turn_end` / `agent_end` 时刷盘。
-- Skill 与提示模板注入（`harness/skills.ts`、`harness/prompt-templates.ts`）。
+1. **事件订阅**：`agent.subscribe(this._handleAgentEvent)` — 接收 `agent_start` / `message_start` / `message_update` / `message_end` / `tool_execution_*` / `turn_end` / `agent_end`，在 `message_end` 时持久化到 `SessionManager`。
+2. **工具拦截钩子**：`agent.beforeToolCall` / `agent.afterToolCall` — 转发给 `ExtensionRunner`，扩展可拦截/修改工具调用。
+3. **prepareNextTurnWithContext**：在每轮 LLM 调用前注入最新的 `systemPrompt` 和 `tools`。
+4. **直接状态读写**：`agent.state.model` / `agent.state.tools` / `agent.state.messages` / `agent.state.systemPrompt`。
 
 ### 4.4 LLM 提供商抽象
 
@@ -289,7 +288,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    Caller[AgentHarness]
+    Caller[AgentSession / Agent]
     Models[ModelsImpl]
     Catalog[model-catalog.ts]
     Auth[resolveProviderAuth]
@@ -326,35 +325,44 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 
 **文件**：
 
-- `packages/coding-agent/src/core/tools/index.ts`
+- `packages/coding-agent/src/core/tools/index.ts` — 工厂函数（`createToolDefinition` / `createTool` / `createAllToolDefinitions`）
 - `packages/coding-agent/src/core/tools/read.ts`、`bash.ts`、`edit.ts`、`write.ts`、`grep.ts`、`find.ts`、`ls.ts`
+- `packages/coding-agent/src/core/tools/tool-definition-wrapper.ts` — `ToolDefinition` ↔ `AgentTool` 转换
+- `packages/coding-agent/src/core/tools/edit-diff.ts` — diff 计算与 fuzzy match
+- `packages/coding-agent/src/core/tools/output-accumulator.ts` — bash 流式输出累积
+- `packages/coding-agent/src/core/tools/truncate.ts` — 通用截断（2000 行 / 50KB）
+- `packages/coding-agent/src/core/tools/file-mutation-queue.ts` — 写操作互斥锁
 - `packages/agent/src/agent-loop.ts` 中 `executeToolCalls()`
+
+注：`coding-agent` 有自己独立的工具实现（`packages/coding-agent/src/core/tools/`），与 `agent-core` 内部 `packages/agent/src/harness/tools/` 的通用实现无关。
 
 工具注册：
 
-- `AgentSession` 通过 `createAllToolDefinitions()` / `createAllTools()` 构建内置工具定义。
-- 扩展通过 `ExtensionRunner` 注册额外工具和命令。
+- `AgentSession._buildRuntime()` → `createAllToolDefinitions()` 生成内置工具定义（`{read, bash, edit, write, grep, find, ls}`）→ 存入 `_baseToolDefinitions`。
+- 扩展通过 `api.registerTool()` → `ExtensionRunner` → `AgentSession._refreshToolRegistry()` 合并到 `_toolDefinitions` 和 `_toolRegistry`。
+- `_refreshToolRegistry()` 合并三路来源：`_baseToolDefinitions` + 扩展注册工具 + SDK 自定义工具，同名工具以扩展/SDK 优先（可覆盖内置工具）。
+- `setActiveToolsByName()` → `agent.state.tools = [...]` + 重建 `systemPrompt`。
 
 执行流程：
 
 1. LLM 返回 `toolCall` 内容块。
 2. `agent-loop.ts` 的 `executeToolCalls()` 根据 `toolExecution` 配置选择串行或并行执行。
-3. `prepareToolCall()`：查找工具、验证参数、运行 `beforeToolCall` 钩子。
+3. `prepareToolCall()`：查找工具、验证参数、运行 `beforeToolCall` 钩子（扩展拦截）。
 4. `executePreparedToolCall()`：调用 `tool.execute()`，可返回流式更新。
-5. `finalizeExecutedToolCall()`：运行 `afterToolCall` 钩子。
+5. `finalizeExecutedToolCall()`：运行 `afterToolCall` 钩子（扩展修改结果）。
 6. 生成 `toolResult` 消息追加到上下文。
 
-内置工具：
+内置工具对比：
 
-| 工具 | 功能 |
-|------|------|
-| `read` | 读取文件内容，支持行范围、图片 |
-| `bash` | 执行 shell 命令，支持 `!` 快捷命令 |
-| `edit` | 基于 diff 的代码编辑 |
-| `write` | 写入/覆盖文件 |
-| `grep` | 文本搜索 |
-| `find` | 文件查找 |
-| `ls` | 目录列表 |
+| 工具 | Schema | 流式 | 截断 | 互斥 | 特殊能力 |
+|------|--------|------|------|------|---------|
+| `read` | path/offset/limit | 否 | truncateHead 2000行/50KB | 无 | 图片检测/resize、紧凑渲染分类（docs/skill/resource） |
+| `bash` | command/timeout | 是（100ms 节流） | truncateTail + temp 文件 | 无 | 进程树管理、命令前缀、PI_* 环境变量注入 |
+| `edit` | path/edits[] | 否 | 无 | fileMutationQueue | fuzzy match（NFKC/引号/空白/破折号）、异步 diff 预览 |
+| `write` | path/content | 是（增量高亮） | 无 | fileMutationQueue | 自动创建父目录、流式语法高亮缓存 |
+| `grep` | pattern/path/glob/context/limit | 否 | match limit(100) + 行(500ch) + bytes(50KB) | 无 | 依赖 ripgrep、`.gitignore` 感知 |
+| `find` | pattern/path | 否 | 有 | 无 | 文件查找 |
+| `ls` | path | 否 | 有 | 无 | 目录列表 |
 
 ### 4.6 交互式渲染与 TUI
 
@@ -415,51 +423,93 @@ flowchart TB
 3. `TUI.handleInput()` 将输入路由到当前焦点组件（通常是 `CustomEditor`）。
 4. `CustomEditor` 优先处理应用快捷键（中断、退出、粘贴图片、扩展快捷键），其余交给 `Editor`。
 5. 编辑器支持自动补全（`autocomplete.ts`）、撤销栈（`undo-stack.ts`）、kill-ring、单词级导航。
-6. 用户提交后，`InteractiveMode` 调用 `session.prompt(text)`。
-7. `AgentSessionEvent` 流驱动 `chatContainer` 中的组件更新（`UserMessageComponent`、`AssistantMessageComponent`、`ToolExecutionComponent`、`SkillInvocationMessageComponent` 等）。
-8. 每次状态变化调用 `TUI.requestRender()`，`TUI` 差分比较前后帧，只重写变化行。
-9. 覆盖层（如模型选择器、会话选择器、主题选择器、思考级别选择器）通过 `showOverlay()` 居中弹出，关闭后焦点返回编辑器。
-10. `terminal-image.ts` 与 `native-modifiers.ts` 提供终端图片预览和原生修饰键检测（Windows/macOS 预编译二进制）。
+6. 用户按 Enter 时，`onSubmit` 回调触发：
+   - 斜杠命令（`/settings`、`/model`、`/compact` 等）→ 直接处理。
+   - `!command` → bash 执行。
+   - 正在 compaction → 排队或执行扩展命令。
+   - 正在 streaming → `session.prompt(text, { streamingBehavior: "steer" })`。
+   - 否则 → 推入 `pendingUserInputs[]` 或通过 `onInputCallback` 传递。
+7. 主循环 `getUserInput()` 从 `pendingUserInputs` 取出消息后调用 `session.prompt(text)`。
+8. `AgentSessionEvent` 流通过 `subscribe(listener)` 驱动 `chatContainer` 中的组件更新（`UserMessageComponent`、`AssistantMessageComponent`、`ToolExecutionComponent`、`SkillInvocationMessageComponent` 等）。
+9. 每次状态变化调用 `TUI.requestRender()`，`TUI` 差分比较前后帧，只重写变化行。
+10. 覆盖层（如模型选择器、会话选择器、主题选择器、思考级别选择器）通过 `showOverlay()` 居中弹出，关闭后焦点返回编辑器。
+11. `terminal-image.ts` 与 `native-modifiers.ts` 提供终端图片预览和原生修饰键检测（Windows/macOS 预编译二进制）。
 
 ### 4.7 上下文压缩
 
 **文件**：
 
-- `packages/agent/src/harness/compaction/compaction.ts`
-- `packages/agent/src/harness/compaction/branch-summarization.ts`
-- `packages/agent/src/harness/session/session.ts`
-- `packages/coding-agent/src/core/compaction/index.ts`
+- `packages/coding-agent/src/core/compaction/index.ts` — re-export
+- `packages/coding-agent/src/core/compaction/compaction.ts` — 核心逻辑（cut point、summarization、compact）
+- `packages/coding-agent/src/core/compaction/utils.ts` — 对话序列化、文件操作追踪
+- `packages/coding-agent/src/core/compaction/branch-summarization.ts` — 分支摘要
 
-当上下文 token 数超过阈值（`contextWindow - reserveTokens`）时触发压缩：
+触发时机（`AgentSession._checkCompaction()`）：
 
-1. `AgentHarness.compact()` → `prepareCompaction()`：
-   - 找到上一次的压缩点。
-   - 计算 cut point，保留最近的 `keepRecentTokens`。
-   - 收集需要摘要的历史消息。
-2. `compact()`：
-   - 将历史消息发送给模型生成结构化摘要。
-   - 处理跨回合切断的情况，生成 turn prefix 摘要。
-   - 返回 `CompactionResult`。
-3. `session.appendCompaction()` 写入 `compaction` 条目。
-4. 后续 `Session.buildContext()` 自动将压缩点之前的条目替换为摘要条目，从而缩小上下文。
+1. **Overflow**：LLM 返回 context overflow 错误 → 移除错误消息 → `_runAutoCompaction("overflow", willRetry=true)` → compact 后自动 retry。
+2. **Threshold**：每次 `agent_end` 后检查 `contextTokens > contextWindow - reserveTokens(16KB)` → `_runAutoCompaction("threshold", willRetry=false)` → compact 后等待用户继续输入。
+
+压缩流程：
+
+```
+_checkCompaction(assistantMsg)
+  └─ _runAutoCompaction(reason, willRetry)
+       └─ prepareCompaction(entries, settings)
+            ├─ 找到上次 compaction 边界 (prevCompactionIndex)
+            ├─ findCutPoint() → 从后往前累加 token
+            │    保留最近 keepRecentTokens(20K) 的对话
+            │    切点只能切在 user/assistant 消息（不切 toolResult）
+            │    如果切在 assistant 中间 → isSplitTurn
+            ├─ 提取 messagesToSummarize（丢弃的历史）
+            ├─ 提取 turnPrefixMessages（如果跨回合切断）
+            └─ 提取 fileOps（读/写过的文件）
+       └─ compact(preparation)
+            ├─ 扩展 session_before_compact 事件（可提供自定义 compaction）
+            ├─ 调用 LLM 生成结构化摘要
+            │   ├─ 有 previousSummary → UPDATE_SUMMARIZATION_PROMPT（增量更新）
+            │   └─ 无 → SUMMARIZATION_PROMPT（全新总结）
+            ├─ 跨回合时额外生成 turn prefix 摘要
+            └─ 返回 { summary, firstKeptEntryId, tokensBefore, usage, details }
+```
+
+压缩后：
+
+```typescript
+this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+const sessionContext = this.sessionManager.buildSessionContext();
+this.agent.state.messages = sessionContext.messages;
+```
+
+Session 文件结构变为：
+```
+[header][compactionEntry][保留的最新消息...]
+             ↑
+      summary + firstKeptEntryId
+```
+
+摘要格式为结构化 Markdown：`## Goal` / `## Progress` / `## Key Decisions` / `## Next Steps` / `## Critical Context`，末尾附加 `## Files Read` / `## Files Modified`。
 
 ### 4.8 会话存储抽象
 
 **文件**：
 
 - `packages/agent/src/harness/types.ts`
-- `packages/agent/src/harness/session/session.ts`
-- `packages/agent/src/harness/session/jsonl-repo.ts`、`jsonl-storage.ts`
-- `packages/agent/src/harness/session/memory-repo.ts`、`memory-storage.ts`
+- `packages/agent/src/harness/session/session.ts`、`state.ts`、`context.ts`、`types.ts`、`index.ts`
+- `packages/agent/src/harness/session/jsonl/`（`repo.ts`、`storage.ts`、`codec.ts`、`errors.ts`、`types.ts`）
+- `packages/agent/src/harness/session/memory.ts`
+- `packages/agent/src/harness/session/testing/`（`conformance.ts`）
+- `packages/agent/src/search/`（`scanning.ts`、`index.ts`）— 基于 SessionStorage 的会话搜索
 - `packages/storage/sqlite-node/src/sqlite/repo.ts`、`storage/index.ts`
 
 `pi-agent-core` 将会话持久化抽象为 `SessionStorage` 接口：
 
 | 后端 | 实现 | 说明 |
 |------|------|------|
-| JSONL | `JsonlSessionStorage` / `JsonlSessionRepo` | 默认后端，每个会话一个 `.jsonl` 文件，兼容旧格式 |
-| Memory | `MemorySessionStorage` / `MemorySessionRepo` | 内存中，测试/评测使用 |
+| JSONL | `JsonlSessionStorage` / `JsonlSessionRepo`（`jsonl/` 目录） | 默认后端，每个会话一个 `.jsonl` 文件，兼容旧格式 |
+| Memory | `MemorySessionStorage` / `MemorySessionRepo`（`memory.ts`） | 内存中，测试/评测使用 |
 | SQLite | `SqliteSessionStorage` / `SqliteSessionRepo` | 可选后端，基于 `node:sqlite`，支持分支物化与迁移 |
+
+会话搜索：`packages/agent/src/search/scanning.ts` 提供 `createScanningSessionSearch()`，通过扫描 SessionStorage 的元数据/条目/标签实现跨会话搜索（支持条目类型过滤、限制命中数、AbortSignal 取消）。
 
 `SessionStorage` 职责：
 
@@ -658,11 +708,12 @@ npm run eval -- --provider <provider> --model <model>
 | `packages/server/src/rpc-process.ts` | Agent 子进程封装与 JSONL 通信 |
 | `packages/server/src/handler.ts` | IPC 请求路由与 rpc_stream 升级 |
 | `packages/server/src/ipc/server.ts` | Unix socket 服务器、流升级 |
+| `packages/server/src/ipc/client.ts` | IPC 客户端 |
 | `packages/server/src/ipc/protocol.ts` | IPC 消息协议类型 |
 | `packages/server/src/radius.ts` | Radius 中继注册与心跳 |
 | `packages/server/src/storage.ts` | instances.json / machine.json 持久化 |
 | `packages/server/src/config.ts` | socket / auth / instances / machine 路径集中配置 |
-| `packages/server/src/types.ts` | server 公共类型 |
+| `packages/server/src/index.ts` | server 公共导出 |
 
 ### Coding Agent
 
@@ -673,30 +724,66 @@ npm run eval -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/sdk.ts` | 程序化 SDK：`createAgentSession()` |
 | `packages/coding-agent/src/core/agent-session-services.ts` | 按 cwd 构建服务 |
 | `packages/coding-agent/src/core/agent-session-runtime.ts` | 运行时与会话切换 |
-| `packages/coding-agent/src/core/agent-session.ts` | 核心会话抽象与事件流 |
+| `packages/coding-agent/src/core/agent-session.ts` | 核心会话抽象与事件流（~3300行） |
 | `packages/coding-agent/src/core/session-manager.ts` | JSONL 会话管理 |
 | `packages/coding-agent/src/core/model-runtime.ts` | 模型运行时与调度 |
 | `packages/coding-agent/src/core/model-resolver.ts` | 模型字符串解析 |
 | `packages/coding-agent/src/core/model-registry.ts` | 模型元数据注册 |
 | `packages/coding-agent/src/core/model-config.ts` | 模型配置（思考级别、上下文等） |
+| `packages/coding-agent/src/core/models-store.ts` | 模型列表缓存 |
+| `packages/coding-agent/src/core/provider-composer.ts` | Provider 组合（扩展自定义 provider/OAuth 配置） |
+| `packages/coding-agent/src/core/provider-attribution.ts` | Provider 归属跟踪 |
 | `packages/coding-agent/src/core/settings-manager.ts` | 用户设置读写 |
+| `packages/coding-agent/src/core/resolve-config-value.ts` | 配置值解析（env/命令/值） |
 | `packages/coding-agent/src/core/resource-loader.ts` | Skill / 提示模板 / 主题资源加载 |
 | `packages/coding-agent/src/core/trust-manager.ts` | 项目信任与权限决策 |
+| `packages/coding-agent/src/core/project-trust.ts` | 项目信任解析 |
 | `packages/coding-agent/src/core/auth-storage.ts` | 认证凭证存储 |
 | `packages/coding-agent/src/core/runtime-credentials.ts` | 运行时凭证解析 |
 | `packages/coding-agent/src/core/remote-catalog-provider.ts` | 远程模型目录拉取 |
+| `packages/coding-agent/src/core/bash-executor.ts` | 统一 bash 执行（AgentSession.executeBash） |
+| `packages/coding-agent/src/core/event-bus.ts` | 事件总线抽象 |
+| `packages/coding-agent/src/core/pi-manifest.ts` | pi manifest 解析（extensions/skills 配置） |
+| `packages/coding-agent/src/core/diagnostics.ts` | 诊断信息 |
+| `packages/coding-agent/src/core/exec.ts` | 进程执行工具 |
+| `packages/coding-agent/src/core/output-guard.ts` | stdout 接管保护 |
+| `packages/coding-agent/src/core/radius.ts` | Radius 集成 |
+| `packages/coding-agent/src/core/telemetry.ts` | 遥测 |
+| `packages/coding-agent/src/core/timings.ts` | 启动计时（PI_TIMING=1） |
+| `packages/coding-agent/src/core/footer-data-provider.ts` | Footer 数据提供（git 分支、扩展状态） |
+| `packages/coding-agent/src/core/keybindings.ts` | 快捷键配置管理 |
+| `packages/coding-agent/src/core/usage-totals.ts` | token 用量统计 |
+| `packages/coding-agent/src/core/cache-stats.ts` | 缓存命中率统计 |
+| `packages/coding-agent/src/core/http-dispatcher.ts` | HTTP 代理配置 |
 | `packages/coding-agent/src/core/extensions/index.ts` | 扩展系统 re-export |
 | `packages/coding-agent/src/core/extensions/loader.ts` | 扩展发现与加载 |
 | `packages/coding-agent/src/core/extensions/runner.ts` | 扩展运行时与生命周期钩子 |
 | `packages/coding-agent/src/core/extensions/types.ts` | 扩展 API 类型 |
 | `packages/coding-agent/src/core/extensions/wrapper.ts` | 扩展工具包装 |
+| `packages/coding-agent/src/core/compaction/compaction.ts` | 上下文压缩核心逻辑 |
+| `packages/coding-agent/src/core/compaction/utils.ts` | 对话序列化、文件操作追踪 |
+| `packages/coding-agent/src/core/compaction/branch-summarization.ts` | 分支摘要 |
 | `packages/coding-agent/src/core/tools/index.ts` | 内置工具工厂 |
+| `packages/coding-agent/src/core/tools/read.ts` | read 工具实现 |
+| `packages/coding-agent/src/core/tools/bash.ts` | bash 工具实现（OutputAccumulator、进程树管理） |
+| `packages/coding-agent/src/core/tools/edit.ts` | edit 工具实现（fuzzy match、异步 diff 预览） |
+| `packages/coding-agent/src/core/tools/edit-diff.ts` | diff 计算引擎 |
+| `packages/coding-agent/src/core/tools/write.ts` | write 工具实现（流式语法高亮缓存） |
+| `packages/coding-agent/src/core/tools/grep.ts` | grep 工具实现（ripgrep JSON 流） |
+| `packages/coding-agent/src/core/tools/find.ts` | find 工具实现 |
+| `packages/coding-agent/src/core/tools/ls.ts` | ls 工具实现 |
+| `packages/coding-agent/src/core/tools/output-accumulator.ts` | bash 流式输出累积与截断 |
+| `packages/coding-agent/src/core/tools/truncate.ts` | 通用截断（2000 行 / 50KB / 500ch 每行） |
+| `packages/coding-agent/src/core/tools/file-mutation-queue.ts` | 写操作互斥锁 |
+| `packages/coding-agent/src/core/tools/tool-definition-wrapper.ts` | ToolDefinition ↔ AgentTool 转换 |
+| `packages/coding-agent/src/core/tools/path-utils.ts` | 路径解析工具 |
+| `packages/coding-agent/src/core/tools/render-utils.ts` | TUI 渲染辅助 |
 | `packages/coding-agent/src/core/skills.ts` | Skill 加载与解析 |
 | `packages/coding-agent/src/core/prompt-templates.ts` | 提示模板加载与展开 |
 | `packages/coding-agent/src/core/slash-commands.ts` | slash 命令解析与分发 |
 | `packages/coding-agent/src/core/export-html/index.ts` | 会话 HTML 导出 |
 | `packages/coding-agent/src/modes/print-mode.ts` | 一次性文本/JSON 模式 |
-| `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | 交互式 TUI 模式 |
+| `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | 交互式 TUI 模式（~6400行） |
 | `packages/coding-agent/src/modes/rpc/` | RPC 模式 |
 | `packages/coding-agent/src/rpc-entry.ts` | server 子进程 RPC 入口 |
 | `packages/coding-agent/src/bun/cli.ts` | Bun 二进制入口包装 |
@@ -705,27 +792,48 @@ npm run eval -- --provider <provider> --model <model>
 
 | 文件 | 职责 |
 |------|------|
-| `packages/agent/src/agent.ts` | 有状态 Agent 包装器 |
-| `packages/agent/src/agent-loop.ts` | 多轮 LLM/工具循环 |
+| `packages/agent/src/agent.ts` | 有状态 Agent 包装器（~600行） |
+| `packages/agent/src/agent-loop.ts` | 多轮 LLM/工具循环（~800行） |
 | `packages/agent/src/types.ts` | 核心类型 |
-| `packages/agent/src/harness/agent-harness.ts` | 生产级 harness |
+| `packages/agent/src/stream-fn.ts` | 默认流函数 |
+| `packages/agent/src/proxy.ts` | Agent 代理 |
+| `packages/agent/src/search/index.ts` | 会话搜索入口 |
+| `packages/agent/src/node.ts` | Node 环境导出 |
+| `packages/agent/src/index.ts` | 公共导出 |
+| `packages/agent/src/harness/agent-harness.ts` | 生产级 harness（注：`coding-agent` 不使用此文件，由 `AgentSession` 直接替换） |
 | `packages/agent/src/harness/types.ts` | harness 类型：FileSystem、ExecutionEnv、SessionStorage、Result |
 | `packages/agent/src/harness/session/session.ts` | 树状会话抽象与上下文构建 |
-| `packages/agent/src/harness/session/jsonl-repo.ts` | JSONL 会话仓库 |
-| `packages/agent/src/harness/session/memory-repo.ts` | 内存会话仓库 |
+| `packages/agent/src/harness/session/state.ts` | 会话状态 |
+| `packages/agent/src/harness/session/context.ts` | 上下文构建 |
+| `packages/agent/src/harness/session/types.ts` | 会话类型定义 |
+| `packages/agent/src/harness/session/jsonl/repo.ts` | JSONL 会话仓库 |
+| `packages/agent/src/harness/session/jsonl/storage.ts` | JSONL SessionStorage 实现 |
+| `packages/agent/src/harness/session/jsonl/codec.ts` | JSONL 编解码 |
+| `packages/agent/src/harness/session/jsonl/errors.ts` | JSONL 错误类型 |
+| `packages/agent/src/harness/session/memory.ts` | 内存 SessionStorage 实现 |
+| `packages/agent/src/harness/session/testing/conformance.ts` | 会话后端一致性测试 |
+| `packages/agent/src/search/scanning.ts` | 基于扫描的会话搜索 |
+| `packages/agent/src/search/index.ts` | SessionSearch 公共导出 |
 | `packages/agent/src/harness/env/nodejs.ts` | Node.js 文件系统/Shell 执行环境实现 |
-| `packages/agent/src/harness/compaction/compaction.ts` | 上下文压缩 |
+| `packages/agent/src/harness/compaction/compaction.ts` | 上下文压缩（注：`coding-agent` 有独立实现） |
 | `packages/agent/src/harness/compaction/branch-summarization.ts` | 分支摘要 |
+| `packages/agent/src/harness/compaction/utils.ts` | 压缩工具 |
 | `packages/agent/src/harness/prompt-templates.ts` | 提示词模板加载 |
 | `packages/agent/src/harness/skills.ts` | harness 层 Skill 注入 |
+| `packages/agent/src/harness/system-prompt.ts` | 系统提示词构建 |
+| `packages/agent/src/harness/messages.ts` | 消息工具 |
 | `packages/agent/src/harness/tools/index.ts` | harness 工具工厂 |
 | `packages/agent/src/harness/tools/bash.ts` | bash 工具实现 |
 | `packages/agent/src/harness/tools/read.ts` | read 工具实现 |
 | `packages/agent/src/harness/tools/edit.ts` | edit 工具实现 |
+| `packages/agent/src/harness/tools/edit-diff.ts` | diff 计算 |
 | `packages/agent/src/harness/tools/write.ts` | write 工具实现 |
 | `packages/agent/src/harness/tools/image.ts` | 图片工具辅助 |
 | `packages/agent/src/harness/tools/file-mutation-queue.ts` | 文件变更队列 |
-| `packages/agent/src/node.ts` | Node 环境导出 |
+| `packages/agent/src/harness/tools/path-utils.ts` | 路径解析 |
+| `packages/agent/src/harness/tools/tool-context.ts` | 工具上下文 |
+| `packages/agent/src/harness/utils/shell-output.ts` | shell 输出工具 |
+| `packages/agent/src/harness/utils/truncate.ts` | 截断工具 |
 
 ### AI
 
