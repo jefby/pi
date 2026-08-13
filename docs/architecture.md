@@ -342,6 +342,7 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 - 扩展通过 `api.registerTool()` → `ExtensionRunner` → `AgentSession._refreshToolRegistry()` 合并到 `_toolDefinitions` 和 `_toolRegistry`。
 - `_refreshToolRegistry()` 合并三路来源：`_baseToolDefinitions` + 扩展注册工具 + SDK 自定义工具，同名工具以扩展/SDK 优先（可覆盖内置工具）。
 - `setActiveToolsByName()` → `agent.state.tools = [...]` + 重建 `systemPrompt`。
+- 默认工具可配置：`settings.json` 中的 `defaultTools`（`SettingsManager.getDefaultTools()`）覆盖默认的 `[read, bash, edit, write]`，优先级低于 `--tools`/`tools` 选项，且不会移除扩展工具。
 
 执行流程：
 
@@ -434,6 +435,7 @@ flowchart TB
 9. 每次状态变化调用 `TUI.requestRender()`，`TUI` 差分比较前后帧，只重写变化行。
 10. 覆盖层（如模型选择器、会话选择器、主题选择器、思考级别选择器）通过 `showOverlay()` 居中弹出，关闭后焦点返回编辑器。
 11. `terminal-image.ts` 与 `native-modifiers.ts` 提供终端图片预览和原生修饰键检测（Windows/macOS 预编译二进制）。
+12. 主题：首次运行检测终端背景自动选择 `dark`/`light`；`--use-theme <name>`（或 `light/dark` 终端感知对）可为单次运行设置初始主题而不修改保存的设置，后续在 `/settings` 中切换会立即生效并正常保存。
 
 ### 4.7 上下文压缩
 
