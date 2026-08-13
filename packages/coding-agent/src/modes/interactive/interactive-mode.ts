@@ -152,6 +152,7 @@ import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import { editInExternalEditor } from "./external-editor.ts";
+import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
 import {
 	getAvailableThemes,
@@ -329,6 +330,8 @@ export interface InteractiveModeOptions {
 	verbose?: boolean;
 	/** TUI layout mode. */
 	tuiMode?: TuiMode;
+	/** Initial interactive theme setting for this invocation. */
+	initialThemeSetting?: string;
 }
 
 interface InteractiveTuiOptions {
@@ -538,6 +541,7 @@ export class InteractiveMode {
 		});
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
+			await this.themeController.applyFromSettings();
 		});
 		this.version = VERSION;
 		this.renderer = createInteractiveTui({
@@ -582,12 +586,12 @@ export class InteractiveMode {
 
 		// Register themes from resource loader and initialize
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
-		this.themeController = new InteractiveThemeController(
-			this.ui,
-			this.settingsManager,
-			(message) => this.showError(message),
-			() => this.updateEditorBorderColor(),
-		);
+		this.themeController = new InteractiveThemeController(this.ui, {
+			getSettingsManager: () => this.settingsManager,
+			showError: (message) => this.showError(message),
+			onChanged: () => this.updateEditorBorderColor(),
+			initialThemeSetting: options.initialThemeSetting,
+		});
 	}
 
 	private getAutocompleteSourceTag(sourceInfo?: SourceInfo): string | undefined {
@@ -1015,8 +1019,7 @@ export class InteractiveMode {
 		if (!process.env.PI_OFFLINE) {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 15_000);
-			void this.session.modelRuntime
-				.refresh({ signal: controller.signal })
+			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
 				.then(() => this.updateAvailableProviderCount())
 				.catch(() => {})
 				.finally(() => clearTimeout(timeout));
@@ -4393,7 +4396,7 @@ export class InteractiveMode {
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
 					thinkingLevel: this.session.thinkingLevel,
 					availableThinkingLevels: this.session.getAvailableThinkingLevels(),
-					currentTheme: this.settingsManager.getThemeSetting() || "dark",
+					currentTheme: this.themeController.getThemeSelection() || "dark",
 					terminalTheme: this.themeController.getTerminalTheme(),
 					availableThemes: getAvailableThemes(),
 					hideThinkingBlock: this.hideThinkingBlock,
@@ -4469,7 +4472,7 @@ export class InteractiveMode {
 					},
 					onThemeChange: (themeSetting) => {
 						this.settingsManager.setTheme(themeSetting);
-						void this.themeController.applyFromSettings();
+						void this.themeController.setThemeSetting(themeSetting);
 					},
 					onThemePreview: (themeName) => this.themeController.preview(themeName),
 					onHideThinkingBlockChange: (hidden) => {
@@ -4629,7 +4632,7 @@ export class InteractiveMode {
 			controller.abort();
 		}, 15_000);
 		try {
-			const result = await this.session.modelRuntime.refresh({ signal: controller.signal });
+			const result = await refreshModelCatalogs(this.session.modelRuntime, controller.signal);
 			if (result.aborted && timedOut) {
 				this.showWarning("Model refresh timed out; searching cached models.");
 			} else if (result.errors.size > 0) {
@@ -4845,8 +4848,7 @@ export class InteractiveMode {
 					},
 				},
 			);
-			void this.session.modelRuntime
-				.refresh({ signal: controller.signal })
+			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
 				.then((result) => {
 					if (disposed) return;
 					availableModels = [...this.session.modelRuntime.getAvailableSnapshot()];
@@ -5778,7 +5780,9 @@ export class InteractiveMode {
 				const filePath = this.session.exportToJsonl(outputPath);
 				this.showStatus(`Session exported to: ${filePath}`);
 			} else {
-				const filePath = await this.session.exportToHtml(outputPath);
+				const filePath = await this.session.exportToHtml(outputPath, {
+					themeName: theme.name,
+				});
 				this.showStatus(`Session exported to: ${filePath}`);
 			}
 		} catch (error: unknown) {
@@ -5875,7 +5879,7 @@ export class InteractiveMode {
 		// Export to a temp file
 		const tmpFile = path.join(os.tmpdir(), "session.html");
 		try {
-			await this.session.exportToHtml(tmpFile);
+			await this.session.exportToHtml(tmpFile, { themeName: theme.name });
 		} catch (error: unknown) {
 			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
 			return;
