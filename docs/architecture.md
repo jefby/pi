@@ -1,6 +1,6 @@
 # Pi 软件流程架构分析
 
-> 分析范围：Pi monorepo 七个核心工作区（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/server`、`packages/evals`、`packages/storage/sqlite-node`）以及若干示例扩展工作区，重点描述它们之间的调用与数据流。
+> 分析范围：Pi monorepo 十个核心工作区（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/server`、`packages/client`、`packages/protocol`、`packages/telemetry`、`packages/evals`、`packages/session-backends/sqlite-node`）以及若干示例扩展工作区，重点描述它们之间的调用与数据流。
 
 ## 目录
 
@@ -32,20 +32,23 @@
 
 Pi 是一个模块化、分层设计的 AI 编程助手运行时：
 
-- **`packages/server`**：可选的本地守护进程，管理多个 `pi-coding-agent` 子进程，通过 Unix Domain Socket 暴露 JSONL IPC；可选注册到 Radius 中继。
-- **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）、Skills、HTML 导出。
-- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、消息队列（steer/followUp）、工具调度、状态管理。下层 `harness/` 目录提供生产级参考实现（SessionStorage、compaction、tools），但 `coding-agent` 有自己独立的同名实现。
+- **`packages/server`**：可选的本地守护进程，管理多个 `pi-coding-agent` 子进程，通过 Unix Domain Socket 暴露 JSONL IPC；可选注册到 Radius 中继。依赖 `pi-protocol` 实现远程会话线协议。
+- **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）、Skills、HTML 导出。依赖 `pi-client`/`pi-protocol` 作为远程会话客户端。
+- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、消息队列（steer/followUp）、工具调度、状态管理。`harness/` 目录提供 Durable AgentHarness v2 实现（tree/facts/lanes/usage ledger 四部分会话模型，见 `packages/agent/docs/harness.md`），但 `coding-agent` 仍有自己独立的会话/工具实现。
 - **`packages/ai`**：统一多提供商 LLM API，封装 OpenAI、Anthropic、Google、Bedrock、Mistral 等协议。
 - **`packages/tui`**：终端 UI 库，提供差分渲染、组件树、键盘输入、编辑器和覆盖层。
+- **`packages/protocol`**：运行时无关的线协议包——schema、类型、CBOR 编解码、字节流 framing，用于 server 与远程会话客户端之间的二进制消息。
+- **`packages/client`**：传输无关的远程会话客户端（`PiClient`），通过 `ByteTransport` 交换长度前缀 CBOR 消息，支持会话创建/获取/订阅/提示。
+- **`packages/telemetry`**：遥测包，提供内存/noop 实现，供 harness 与 server 观察与追踪。
 - **`packages/evals`**：内部行为评测包，基于 `vitest-evals` 对 coding-agent 进行端到端评测。
-- **`packages/storage/sqlite-node`**：`pi-agent-core` 的可选 SQLite 会话存储后端，基于 `node:sqlite`。
+- **`packages/session-backends/sqlite-node`**：`pi-agent-core` 的可选 SQLite 会话存储后端（自 `packages/storage/sqlite-node` 迁移），基于 `node:sqlite`，实现 tree/lanes/facts/records 四类存储。
 
 整体数据流向：
 
 ```mermaid
 flowchart LR
     User[用户/外部客户端]
-    Server[server.sock<br/>JSONL IPC]
+    Server[server.sock<br/>二进制线协议]
     CodingAgent[pi-coding-agent]
     Agent[Agent 运行时]
     AI[pi-ai 提供商层]
@@ -53,9 +56,13 @@ flowchart LR
     TUI[pi-tui 终端 UI]
     Tools[文件/Shell 工具]
     Evals[pi-evals]
+    Client[pi-client 远程客户端]
+    Protocol[pi-protocol 线协议]
     Storage[(SQLite / JSONL)]
 
     User -->|cli / rpc| CodingAgent
+    Client -->|CBOR 消息| Protocol
+    Protocol -->|字节流| Server
     Server -->|spawn/rpc| CodingAgent
     CodingAgent -->|"new Agent()"| Agent
     Agent -->|stream| AI
@@ -96,15 +103,18 @@ flowchart TB
         TUI["@earendil-works/pi-tui"]
     end
 
-    subgraph Layer2["可选持久化层"]
-        Storage["@earendil-works/pi-storage-sqlite-node"]
+    subgraph Layer2["线协议/客户端层"]
+        Protocol["@earendil-works/pi-protocol"]
+        Client["@earendil-works/pi-client"]
+        Telemetry["@earendil-works/pi-telemetry"]
     end
 
-    subgraph Layer1["评测层"]
+    subgraph Layer1["可选持久化层"]
+        Storage["@earendil-works/pi-session-backends-sqlite-node"]
+    end
+
+    subgraph Layer0["评测/示例扩展层"]
         Evals["@earendil-works/pi-evals"]
-    end
-
-    subgraph Layer0["示例扩展层"]
         Examples["packages/coding-agent/examples/extensions/*"]
     end
 
@@ -113,7 +123,11 @@ flowchart TB
     CodingAgent --> AgentCore
     CodingAgent --> TUI
     AgentCore --> AI
+    ServerPkg -->|CBOR| Protocol
+    Client -->|CBOR| Protocol
+    CodingAgent -->|pi-client| Client
     AgentCore -.->|SessionStorage| Storage
+    AgentCore -.->|telemetry| Telemetry
     Evals -->|harness| CodingAgent
     Examples -.->|extends| CodingAgent
 ```
@@ -122,11 +136,14 @@ flowchart TB
 |------|------|----------|
 | 外部入口 | `pi-server` | 多实例守护、进程监管、RPC 桥接、Radius 中继 |
 | 外部入口 | `pi-coding-agent` CLI | 参数解析、模式分发、主函数入口 |
-| 应用/SDK | `pi-coding-agent` | 会话管理、扩展、工具、模式实现、配置、Skills、导出、模型解析、OAuth/Radius 集成 |
-| Agent 运行时 | `pi-agent-core` | 多轮循环、消息队列、工具调度、压缩、持久化抽象、执行环境抽象 |
+| 应用/SDK | `pi-coding-agent` | 会话管理、扩展、工具、模式实现、配置、Skills、导出、模型解析、OAuth/Radius 集成、远程会话客户端 |
+| Agent 运行时 | `pi-agent-core` | 多轮循环、消息队列、工具调度、压缩、持久化抽象、执行环境抽象、Durable AgentHarness v2 |
 | LLM 抽象 | `pi-ai` | 多提供商注册、认证、流式请求、协议转换、模型目录、图像生成 |
 | 终端 UI | `pi-tui` | 差分渲染、组件、输入、编辑器、覆盖层、图片/原生修饰键支持 |
-| 可选持久化 | `pi-storage-sqlite-node` | SQLite 会话后端、迁移、物化状态 |
+| 线协议 | `pi-protocol` | schema/类型、CBOR 编解码、字节流 framing、消息校验 |
+| 客户端 | `pi-client` | 传输无关的远程会话客户端（PiClient、SessionLease） |
+| 遥测 | `pi-telemetry` | 内存/noop 遥测实现，观测与追踪 |
+| 可选持久化 | `pi-session-backends-sqlite-node` | SQLite 会话后端（自 `pi-storage-sqlite-node` 迁移）、tree/lanes/facts/records 存储 |
 | 评测 | `pi-evals` | 基于 `vitest-evals` 的端到端行为评测 |
 | 示例扩展 | `packages/coding-agent/examples/extensions/*` | 自定义 Provider、沙箱、GitLab Duo 等扩展示例 |
 
@@ -499,20 +516,46 @@ Session 文件结构变为：
 - `packages/agent/src/harness/types.ts`
 - `packages/agent/src/harness/session/session.ts`、`state.ts`、`context.ts`、`types.ts`、`index.ts`
 - `packages/agent/src/harness/session/jsonl/`（`repo.ts`、`storage.ts`、`codec.ts`、`errors.ts`、`types.ts`）
+- `packages/agent/src/harness/session/jsonl/v3.ts`（coding-agent v3 格式兼容层）
 - `packages/agent/src/harness/session/memory.ts`
 - `packages/agent/src/harness/session/testing/`（`conformance.ts`）
 - `packages/agent/src/search/`（`scanning.ts`、`index.ts`）— 基于 SessionStorage 的会话搜索
-- `packages/storage/sqlite-node/src/sqlite/repo.ts`、`storage/index.ts`
+- `packages/agent/src/harness/events.ts`、`reducer.ts`、`result.ts`、`telemetry.ts` — AgentHarness v2 事件/规约/结果/遥测
+- `packages/session-backends/sqlite-node/src/sqlite/`（`repo.ts`、`storage/`、`migrations/`、`search-backend.ts`、`branch-cache.ts`、`sql.ts`）
 
 `pi-agent-core` 将会话持久化抽象为 `SessionStorage` 接口：
 
 | 后端 | 实现 | 说明 |
 |------|------|------|
-| JSONL | `JsonlSessionStorage` / `JsonlSessionRepo`（`jsonl/` 目录） | 默认后端，每个会话一个 `.jsonl` 文件，兼容旧格式 |
+| JSONL | `JsonlSessionStorage` / `JsonlSessionRepo`（`jsonl/` 目录） | 默认后端，每个会话一个 `.jsonl` 文件，兼容旧格式与 coding-agent v3 格式 |
 | Memory | `MemorySessionStorage` / `MemorySessionRepo`（`memory.ts`） | 内存中，测试/评测使用 |
-| SQLite | `SqliteSessionStorage` / `SqliteSessionRepo` | 可选后端，基于 `node:sqlite`，支持分支物化与迁移 |
+| SQLite | `SqliteSessionStorage` / `SqliteSessionRepo` | 可选后端，位于 `packages/session-backends/sqlite-node`（自 `packages/storage/sqlite-node` 迁移），基于 `node:sqlite`，实现 entries/lanes/facts/records 四类存储 + 分支缓存 + 搜索后端 |
 
 会话搜索：`packages/agent/src/search/scanning.ts` 提供 `createScanningSessionSearch()`，通过扫描 SessionStorage 的元数据/条目/标签实现跨会话搜索（支持条目类型过滤、限制命中数、AbortSignal 取消）。
+
+#### Durable AgentHarness v2（`packages/agent/docs/harness.md`）
+
+pi 2.0 的核心架构更新。会话由四部分组成：
+
+1. **Entry tree（条目树）**：不可变消息/压缩/分支摘要/自定义条目，`parentId` 链接，只追加。
+2. **Facts（事实）**：可变、命名空间的键值状态（会话名、标签、应用自定义事实）。
+3. **Lanes（泳道）**：树的命名游标。每个会话必有 `main`；一个 lane 拥有自己的 leaf、模型配置、队列和最多一个运行中操作。支持 Slack 线程、子代理等并行工作。
+4. **Usage ledger（用量账本）**：追加式 token/成本事件。
+
+存储层三存储模型：
+
+- `entries` — 写一次、只追加的会话树
+- `registers` — 可变命名空间单元格（`op.meta` 写一次、`op.state` 每次转换整体覆盖）
+- `usage ledger` — 追加式成本行
+
+关键机制：
+
+- **原子事务**：条目插入 + 用量插入 + 寄存器写入，全有或全无，严格递增序列号。
+- **持久化程序计数器**：每步后整体覆盖 `op.state/{operationId}`，恢复时读取该寄存器而非重放日志。
+- **效果三明治（effect sandwich）**：provider 请求和工具调用被两次提交包裹（intent → 执行 → settlement），崩溃可恢复。
+- **确定性步进**：所有效果跨注入边界；`drive: "manual"` 模式下测试逐调用驱动。
+
+兼容性策略：旧 coding-agent v3 JSONL 会话必须能打开并恢复 idle；其余格式/API 可破坏。
 
 `SessionStorage` 职责：
 
@@ -521,7 +564,7 @@ Session 文件结构变为：
 - 提供 `getPathToRootOrCompaction()` 构建模型上下文。
 - 物化会话统计（token、工具调用数）与标签。
 
-`coding-agent` 当前默认仍使用 JSONL 的 `SessionManager`（在 `packages/coding-agent/src/core/session-manager.ts` 中），该管理器内部实现与 `pi-agent-core` 的抽象并行演进；`pi-storage-sqlite-node` 则为需要 SQLite 后端的调用方提供即插即用实现。
+`coding-agent` 当前默认仍使用 JSONL 的 `SessionManager`（在 `packages/coding-agent/src/core/session-manager.ts` 中），该管理器内部实现与 `pi-agent-core` 的抽象并行演进；`pi-session-backends-sqlite-node` 则为需要 SQLite 后端的调用方提供即插即用实现。
 
 ### 4.9 Skills、提示模板与扩展系统
 
@@ -675,7 +718,7 @@ npm run eval -- --provider <provider> --model <model>
 |------|------|------|
 | Agent 配置目录 | `~/.pi/agent/`（可通过 `PI_CODING_AGENT_DIR` 覆盖） | 所有 coding-agent 数据根目录 |
 | 会话历史（JSONL） | `~/.pi/agent/sessions/<encoded-cwd>/<id>.jsonl` | 树状结构的消息、模型变更、思考级别变更、压缩摘要 |
-| 会话历史（SQLite） | `<db-path>`（可配置） | 可选 `SqliteSessionRepo` 持久化，含 sessions / session_entries / branch_entries / session_materialized 等表 |
+| 会话历史（SQLite） | `<db-path>`（可配置） | 可选 `SqliteSessionRepo` 持久化（`packages/session-backends/sqlite-node`），含 entries / lanes / facts / records 等表 + 分支缓存 + 搜索后端 |
 | 设置 | `~/.pi/agent/settings.json` | 用户偏好、模型、Provider 凭证引用 |
 | 凭证 | 系统密钥存储 / `~/.pi/agent/credentials` | API key / OAuth token（由 `CredentialStore` 抽象） |
 | 模型缓存 | `~/.pi/agent/models.json` | 各 Provider 的动态模型列表缓存 |
@@ -806,6 +849,13 @@ npm run eval -- --provider <provider> --model <model>
 | `packages/agent/src/index.ts` | 公共导出 |
 | `packages/agent/src/harness/agent-harness.ts` | 生产级 harness（注：`coding-agent` 不使用此文件，由 `AgentSession` 直接替换） |
 | `packages/agent/src/harness/types.ts` | harness 类型：FileSystem、ExecutionEnv、SessionStorage、Result |
+| `packages/agent/src/harness/events.ts` | AgentHarness v2 事件订阅接口 |
+| `packages/agent/src/harness/reducer.ts` | AgentHarness v2 状态规约 |
+| `packages/agent/src/harness/result.ts` | 运行结果类型 |
+| `packages/agent/src/harness/telemetry.ts` | harness 遥测接入 |
+| `packages/agent/docs/harness.md` | Durable AgentHarness v2 实现规范（~2900行） |
+| `packages/agent/docs/search.md` | 会话搜索服务规范 |
+| `packages/agent/docs/telemetry-schema.md` | 遥测 schema |
 | `packages/agent/src/harness/session/session.ts` | 树状会话抽象与上下文构建 |
 | `packages/agent/src/harness/session/state.ts` | 会话状态 |
 | `packages/agent/src/harness/session/context.ts` | 上下文构建 |
@@ -814,6 +864,7 @@ npm run eval -- --provider <provider> --model <model>
 | `packages/agent/src/harness/session/jsonl/storage.ts` | JSONL SessionStorage 实现 |
 | `packages/agent/src/harness/session/jsonl/codec.ts` | JSONL 编解码 |
 | `packages/agent/src/harness/session/jsonl/errors.ts` | JSONL 错误类型 |
+| `packages/agent/src/harness/session/jsonl/v3.ts` | coding-agent v3 格式兼容层 |
 | `packages/agent/src/harness/session/memory.ts` | 内存 SessionStorage 实现 |
 | `packages/agent/src/harness/session/testing/conformance.ts` | 会话后端一致性测试 |
 | `packages/agent/src/search/scanning.ts` | 基于扫描的会话搜索 |
@@ -890,17 +941,57 @@ npm run eval -- --provider <provider> --model <model>
 | `packages/tui/src/terminal-image.ts` | 终端图片渲染 |
 | `packages/tui/src/native-modifiers.ts` | 原生修饰键检测 |
 
-### Storage (SQLite Node)
+### Protocol (线协议)
 
 | 文件 | 职责 |
 |------|------|
-| `packages/storage/sqlite-node/src/index.ts` | Node sqlite 适配器与后端导出 |
-| `packages/storage/sqlite-node/src/sqlite/repo.ts` | `SqliteSessionRepo`：create/open/list/delete/fork |
-| `packages/storage/sqlite-node/src/sqlite/storage/index.ts` | `SqliteSessionStorage`：SessionStorage 实现 |
-| `packages/storage/sqlite-node/src/sqlite/storage/session-entries.ts` | 会话条目编码/解码 |
-| `packages/storage/sqlite-node/src/sqlite/storage/branch-entries.ts` | 分支路径物化 |
-| `packages/storage/sqlite-node/src/sqlite/storage/session-materialized.ts` | 物化状态与统计 |
-| `packages/storage/sqlite-node/src/sqlite/migrations.ts` | 数据库迁移 |
+| `packages/protocol/src/cbor/encoder.ts` | CBOR 编码器 |
+| `packages/protocol/src/cbor/decoder.ts` | CBOR 解码器 |
+| `packages/protocol/src/cbor/options.ts` | CBOR 选项 |
+| `packages/protocol/src/framing.ts` | 字节流 framing（4 字节长度前缀 + CBOR 项） |
+| `packages/protocol/src/schemas.ts` | 消息 schema（hello、request/response、event 信封） |
+| `packages/protocol/src/codec.ts` | 客户端/服务端消息编解码与校验 |
+| `packages/protocol/src/index.ts` | 公共导出 |
+
+### Client (远程会话客户端)
+
+| 文件 | 职责 |
+|------|------|
+| `packages/client/src/client.ts` | `PiClient`：连接、会话管理、快照订阅 |
+| `packages/client/src/connection.ts` | 连接生命周期与重连 |
+| `packages/client/src/session-handle.ts` | `SessionLease`：会话句柄（prompt/subscribe/acquire） |
+| `packages/client/src/transport.ts` | `ByteTransport` 接口 |
+| `packages/client/src/state.ts` | 客户端快照状态 |
+| `packages/client/src/unix.ts` | Unix socket 传输 |
+| `packages/client/src/errors.ts` | 错误类型 |
+| `packages/client/src/types.ts` | 客户端类型 |
+
+### Telemetry (遥测)
+
+| 文件 | 职责 |
+|------|------|
+| `packages/telemetry/src/index.ts` | 遥测公共导出 |
+| `packages/telemetry/src/memory.ts` | 内存遥测实现 |
+| `packages/telemetry/src/noop.ts` | noop 遥测实现 |
+
+### Session Backends (SQLite Node)
+
+| 文件 | 职责 |
+|------|------|
+| `packages/session-backends/sqlite-node/src/index.ts` | Node sqlite 适配器与后端导出 |
+| `packages/session-backends/sqlite-node/src/sqlite/repo.ts` | `SqliteSessionRepo`：create/open/list/delete/fork |
+| `packages/session-backends/sqlite-node/src/sqlite/storage/entries.ts` | 会话条目编码/解码 |
+| `packages/session-backends/sqlite-node/src/sqlite/storage/lanes.ts` | 泳道状态存储 |
+| `packages/session-backends/sqlite-node/src/sqlite/storage/facts.ts` | 事实存储 |
+| `packages/session-backends/sqlite-node/src/sqlite/storage/records.ts` | 操作日志存储 |
+| `packages/session-backends/sqlite-node/src/sqlite/storage/branch-entries.ts` | 分支路径物化 |
+| `packages/session-backends/sqlite-node/src/sqlite/storage/branch-tips.ts` | 分支尖端物化 |
+| `packages/session-backends/sqlite-node/src/sqlite/storage/session-sequences.ts` | 序列号存储 |
+| `packages/session-backends/sqlite-node/src/sqlite/storage/session-stats.ts` | 会话统计 |
+| `packages/session-backends/sqlite-node/src/sqlite/migrations/` | 数据库迁移（001_initial.sql） |
+| `packages/session-backends/sqlite-node/src/sqlite/branch-cache.ts` | 分支缓存 |
+| `packages/session-backends/sqlite-node/src/sqlite/search-backend.ts` | 搜索后端 |
+| `packages/session-backends/sqlite-node/src/sqlite/sql.ts` | SQL 工具 |
 
 ### Evals
 
@@ -922,8 +1013,11 @@ Pi 的架构呈现清晰的纵向分层：
 3. **运行时层**（`agent-core`）提供与产品无关的 Agent 循环、状态、压缩、可插拔存储与执行环境抽象，并内置 read/bash/edit/write 等通用工具实现。
 4. **LLM 层**（`ai`）将多提供商差异收敛为统一的消息/事件/认证模型，支持图像生成与多种 OAuth 流程。
 5. **UI 层**（`tui`）提供高效差分渲染的终端组件系统，支持图片、原生修饰键、自动补全等编辑器增强。
-6. **持久化层**（`storage/sqlite-node`）提供可选的 SQLite 后端实现。
-7. **评测层**（`evals`）对 coding-agent 进行端到端行为评测。
-8. **示例扩展层**（`packages/coding-agent/examples/extensions/*`）展示如何扩展 Provider、UI 与沙箱。
+6. **线协议/客户端层**（`protocol`/`client`）为远程会话提供二进制消息协议与传输无关的客户端；**遥测层**（`telemetry`）提供可插拔观测。
+7. **持久化层**（`session-backends/sqlite-node`，自 `storage/sqlite-node` 迁移）提供可选的 SQLite 后端实现（entries/lanes/facts/records）。
+8. **评测层**（`evals`）对 coding-agent 进行端到端行为评测。
+9. **示例扩展层**（`packages/coding-agent/examples/extensions/*`）展示如何扩展 Provider、UI 与沙箱。
+
+**Pi 2.0（AgentHarness v2）方向**：`packages/agent/docs/harness.md` 定义了持久化 Agent 运行时（entry tree + facts + lanes + usage ledger 四部分会话模型、三存储原子事务、效果三明治、崩溃恢复），配套 `protocol`/`client` 包支持远程会话接入，SQLite 后端迁移至 `session-backends`。这是与当前 `coding-agent` 并行的新一代架构。
 
 核心控制流是：用户输入 → `AgentSession.prompt()` → `Agent` 循环 → `Models.stream()` → 上游 LLM → 流式事件 → 工具执行 → 事件持久化 → UI/stdout 渲染。扩展和钩子机制贯穿整个流程，允许在输入、LLM 请求、工具调用、输出渲染等节点注入自定义行为。
