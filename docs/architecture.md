@@ -149,7 +149,7 @@ flowchart TB
 |------|----------|----------|------|
 | `interactive` | 默认 TTY | `modes/interactive/interactive-mode.ts` | 启动 TUI，持续对话 |
 | `print`（内部）/ `text`（CLI） | `--print`、stdin/stdout 非 TTY，或 `--mode text` | `modes/print-mode.ts` | 一次性输出文本 |
-| `json` | `--mode json` | `modes/print-mode.ts` | 一次性输出 JSONL 事件流 |
+| `json` | `--mode json` | `modes/print-mode.ts`（事件序列化：`modes/json-event.ts`） | 一次性输出 JSONL 事件流；`message_update` 事件携带累计 `usage` |
 | `rpc` | `--mode rpc` | `modes/rpc/` | 通过 stdin/stdout JSONL 接收 `RpcCommand` |
 
 ### 3.3 模式数据流
@@ -204,6 +204,7 @@ main.ts
   └─ createAgentSessionRuntime(createRuntime)
        └─ createAgentSessionServices()  # 按 cwd 构建服务
             ├─ ModelRuntime            # core/model-runtime.ts
+            ├─ ModelCatalogRefresh      # modes/interactive/model-catalog-refresh.ts（并发刷新协调器）
             ├─ SettingsManager         # core/settings-manager.ts
             ├─ ResourceLoader          # core/resource-loader.ts
             ├─ ModelResolver           # core/model-resolver.ts
@@ -733,6 +734,7 @@ npm run eval -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/model-registry.ts` | 模型元数据注册 |
 | `packages/coding-agent/src/core/model-config.ts` | 模型配置（思考级别、上下文等） |
 | `packages/coding-agent/src/core/models-store.ts` | 模型列表缓存 |
+| `packages/coding-agent/src/modes/interactive/model-catalog-refresh.ts` | 模型目录并发刷新协调器（共享同一刷新、abort 感知等待） |
 | `packages/coding-agent/src/core/provider-composer.ts` | Provider 组合（扩展自定义 provider/OAuth 配置） |
 | `packages/coding-agent/src/core/provider-attribution.ts` | Provider 归属跟踪 |
 | `packages/coding-agent/src/core/settings-manager.ts` | 用户设置读写 |
