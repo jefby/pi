@@ -71,7 +71,24 @@
 
 ### ripgrep / fd（唯一硬缺口）
 
-1. **Rust 交叉编译**：Rust 官方支持 QNX 目标（`aarch64-unknown-nto-qnx710` / `x86_64-unknown-nto-qnx710`，Tier 3），ripgrep/fd 均为纯 Rust，交叉编译可行
+**源码位置**：
+
+| 工具 | 上游源码 | 本地副本 |
+|------|----------|----------|
+| ripgrep (rg) | https://github.com/BurntSushi/ripgrep | https://github.com/jefby/XXX（已复制） |
+| fd | https://github.com/sharkdp/fd | https://github.com/jefby/XXX（已复制） |
+
+（pi 的 `tools-manager.ts` 硬编码了上游仓库：`repo: "BurntSushi/ripgrep"` / `repo: "sharkdp/fd"`）
+
+解决路径（三选一）：
+
+1. **Rust 交叉编译**：Rust 官方支持 QNX 目标（`aarch64-unknown-nto-qnx710` / `x86_64-unknown-nto-qnx710`，Tier 3），ripgrep/fd 均为纯 Rust，交叉编译可行：
+   ```bash
+   rustup target add aarch64-unknown-nto-qnx710
+   export QNX_TARGET=/path/to/qnx800/target/qnx7
+   export QNX_HOST=/path/to/qnx800/host/linux/x86_64
+   cargo build --release --target aarch64-unknown-nto-qnx710
+   ```
 2. **提交 aports PR**：qnx-ports/aports 活跃（nodejs、llama.cpp 均通过 PR 进入）
 3. **放 PATH 即可**：`getToolPath()` 先查系统 PATH 再尝试下载（`tools-manager.ts`），rg/fd 存在于 PATH 即被使用
 
