@@ -12,7 +12,7 @@
 - QNX 8.0 以 aarch64 为一等目标（官方 BSP：`qnx/bsp_raspberrypi-bcm2712-rpi5`；QSTI 提供 QEMU aarch64 与 RPi5 镜像），仅 little-endian
 - nodejs APKBUILD `arch="all"` → 所有架构可构建；aports 构建方式为 **QNX target 本机构建**（官方 codelab：QEMU 或 RPi5 上跑 `abuild`，产物输出 `~/packages/extra/<arch>/`），RPi5 上构建即产出 aarch64 apk
 - qnx-ports/node `configure.py`：`valid_arch` 含 `arm64`，`maglev_enabled_architectures = ('x64', 'arm', 'arm64')` → V8 arm64 后端已启用
-- rg/fd 交叉编译目标：Rust 官方 `aarch64-unknown-nto-qnx710`（x86_64 为 `x86_64-unknown-nto-qnx710`）
+- rg/fd 交叉编译目标（QNX SDP 8.0）：Rust 官方 `aarch64-unknown-qnx`（x86_64 为 `x86_64-pc-qnx`）。注意 `*-nto-qnx710` 目标属于 QNX SDP 7.1，不适用于 8.0
 - 佐证：aports 的 AI 生态包（llama.cpp #398、whisper.cpp #539、ncnn #543、pytorch #446）面向 aarch64 嵌入式/边缘场景，构建体系在 aarch64 上运行良好
 
 ## 证据链（GitHub 搜索）
@@ -82,12 +82,18 @@
 
 解决路径（三选一）：
 
-1. **Rust 交叉编译**：Rust 官方支持 QNX 目标（`aarch64-unknown-nto-qnx710` / `x86_64-unknown-nto-qnx710`，Tier 3），ripgrep/fd 均为纯 Rust，交叉编译可行：
+1. **Rust 交叉编译**（目标三元组与 QNX 版本对应关系）：
+
+   | 目标 | QNX 版本 |
+   |------|----------|
+   | `aarch64-unknown-qnx` / `x86_64-pc-qnx` | **QNX SDP 8.0+**（`target_os="qnx"`，仅 io-sock 网络栈） |
+   | `aarch64-unknown-nto-qnx710` / `x86_64-pc-nto-qnx710` | QNX SDP 7.1（io-pkt，**不适用 8.0**） |
+
+   QNX 8.0 支持由 rust-lang/rust 2026-07 合并（PR #158449 改名、#158697 libstd 修复，需 libc-0.2 backport + cc-rs #1775），完整 std 标记为进行中（QEMU 上已验证 std 基本可用）。需要较新 Rust（含上述 PR，建议 nightly 或最新 stable）以及 QNX SDP 8.0 + `source qnxsdp-env.sh`（`qcc` 在 PATH）：
    ```bash
-   rustup target add aarch64-unknown-nto-qnx710
-   export QNX_TARGET=/path/to/qnx800/target/qnx7
-   export QNX_HOST=/path/to/qnx800/host/linux/x86_64
-   cargo build --release --target aarch64-unknown-nto-qnx710
+   rustup target add aarch64-unknown-qnx        # 或 x86_64-pc-qnx
+   source /path/to/qnxsdp-env.sh                # 初始化 QNX SDP 8.0，qcc 入 PATH
+   cargo build --release --target aarch64-unknown-qnx
    ```
 2. **提交 aports PR**：qnx-ports/aports 活跃（nodejs、llama.cpp 均通过 PR 进入）
 3. **放 PATH 即可**：`getToolPath()` 先查系统 PATH 再尝试下载（`tools-manager.ts`），rg/fd 存在于 PATH 即被使用
