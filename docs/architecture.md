@@ -221,7 +221,7 @@ main.ts
   └─ createAgentSessionRuntime(createRuntime)
        └─ createAgentSessionServices()  # 按 cwd 构建服务
             ├─ ModelRuntime            # core/model-runtime.ts
-            ├─ ModelCatalogRefresh      # modes/interactive/model-catalog-refresh.ts（并发刷新协调器）
+            ├─ ModelCatalogRefresh      # modes/interactive/model-catalog-refresh.ts（并发刷新协调器；远程目录请求带每次尝试超时，挂起请求中止并重试）
             ├─ SettingsManager         # core/settings-manager.ts
             ├─ ResourceLoader          # core/resource-loader.ts
             ├─ ModelResolver           # core/model-resolver.ts
@@ -337,7 +337,7 @@ flowchart LR
 5. API 模块将归一化的 `Context` 转换为提供商特定请求体，创建 SDK 客户端，发起流式请求。
 6. 上游事件被解析为标准 `AssistantMessageEvent`：`start`、`text_delta`、`thinking_*`、`toolcall_*`、`done`、`error`。
 
-Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex、Bedrock、Azure OpenAI、Mistral、Cerebras、DeepSeek、Fireworks、Groq、Together、OpenRouter、GitHub Copilot、Cloudflare、Moonshot、Qwen、MiniMax、xAI、ZAI 等数十个 provider，每个 provider 通常包含 `index.ts` 与 `<name>.models.ts` 分别描述能力与模型列表。`images.ts` 与 `image-models.generated.ts` 提供统一的图像生成入口。
+Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex、Bedrock、Azure OpenAI、Mistral、Cerebras、DeepSeek、Fireworks、Groq、Together、OpenRouter、GitHub Copilot、Cloudflare、Moonshot、Qwen、MiniMax、xAI、ZAI 等数十个 provider，每个 provider 通常包含 `index.ts` 与 `<name>.models.ts` 分别描述能力与模型列表。`images.ts` 与 `image-models.generated.ts` 提供统一的图像生成入口。部分 provider 有特殊行为：xAI 模型统一通过 Responses API 路由（默认 Grok 4.6）；Google 思考级别遵循官方级别映射；Kimi 追踪缓存 token 用量；ZAI 使用中文 Coding Plan 模型目录；废弃的 Xiaomi 模型已移除。
 
 ### 4.5 工具执行
 
@@ -492,6 +492,10 @@ _checkCompaction(assistantMsg)
             └─ 返回 { summary, firstKeptEntryId, tokensBefore, usage, details }
 ```
 
+摘要请求的会话路由：`completeSummarization()` 复用调用方传入的 `sessionId`，使压缩摘要与当前会话使用相同的路由/Provider 配置；无会话 ID 的调用（如分支摘要）使用全新路由 ID，且摘要请求不写缓存（`cacheRetention: "none"`）。
+
+压缩失败或中止时触发 `session_compact_failed` 扩展事件（`reason` 为 `manual`/`threshold`/`overflow`，另含 `errorMessage`、`aborted`、`willRetry`、`fromExtension`），与 `session_before_compact` / `session_compact` 配对，供遥测扩展追踪压缩结局。
+
 压缩后：
 
 ```typescript
@@ -580,6 +584,11 @@ pi 2.0 的核心架构更新。会话由四部分组成：
 Skills：
 
 - 从 `.pi/skills/`、项目 `.skills/` 或显式路径加载 `SKILL.md` 文件。
+- 发现规则：
+  - 在 `~/.pi/agent/skills/` 与 `.pi/skills/` 中，根级 `.md` 文件仅在拥有有效 skill frontmatter 且 `description` 非空时才作为独立 skill 加载。
+  - 所有 skill 位置中，包含 `SKILL.md` 的目录被递归发现。
+  - 在 `~/.agents/skills/` 与项目 `.agents/skills/` 中，根级 `.md` 文件被忽略，但分组目录内的嵌套 `.md` 文件在声明 skill frontmatter 时会被发现。
+  - 不含 skill frontmatter 的普通 Markdown 文件被静默忽略。
 - 解析 YAML frontmatter（`name`、`description`、`disable-model-invocation`）。
 - 以 XML 块形式注入系统提示词，供模型参考。
 - 用户可在输入中使用 `<skill name="..." location="...">...</skill>` 块显式调用。
@@ -607,7 +616,7 @@ Skills：
 
 内置扩展：
 
-- `packages/coding-agent/src/extensions/llama/`：本地 LLaMA 推理支持（`client.ts`、`provider.ts`、`ui.ts`、`huggingface.ts`、`index.ts`）。
+- `packages/coding-agent/src/extensions/llama/`：本地 LLaMA 推理支持（`client.ts`、`provider.ts`、`ui.ts`、`huggingface.ts`、`index.ts`）。模型发现允许网络请求，sleeping 中的模型也会暴露；guidance 无默认值。若路由器以 `--no-models-autoload` 启动，`/login llama.cpp` 仅保存连接，需 `/llama` 加载模型后再 `/model` 选择。
 
 ### 4.10 HTML 会话导出
 
@@ -778,6 +787,9 @@ npm run eval -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/model-config.ts` | 模型配置（思考级别、上下文等） |
 | `packages/coding-agent/src/core/models-store.ts` | 模型列表缓存 |
 | `packages/coding-agent/src/modes/interactive/model-catalog-refresh.ts` | 模型目录并发刷新协调器（共享同一刷新、abort 感知等待） |
+| `packages/coding-agent/src/core/remote-catalog-provider.ts` | 远程模型目录拉取（每次尝试 4s 超时，挂起请求中止并重试） |
+| `packages/coding-agent/src/utils/management-http.ts` | `fetchWithRetry`：整体时间预算 + 每次尝试超时 |
+| `packages/coding-agent/src/utils/pi-user-agent.ts` | pi User-Agent 构造（模型目录/管理请求） |
 | `packages/coding-agent/src/core/provider-composer.ts` | Provider 组合（扩展自定义 provider/OAuth 配置） |
 | `packages/coding-agent/src/core/provider-attribution.ts` | Provider 归属跟踪 |
 | `packages/coding-agent/src/core/settings-manager.ts` | 用户设置读写 |
@@ -787,7 +799,6 @@ npm run eval -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/project-trust.ts` | 项目信任解析 |
 | `packages/coding-agent/src/core/auth-storage.ts` | 认证凭证存储 |
 | `packages/coding-agent/src/core/runtime-credentials.ts` | 运行时凭证解析 |
-| `packages/coding-agent/src/core/remote-catalog-provider.ts` | 远程模型目录拉取 |
 | `packages/coding-agent/src/core/bash-executor.ts` | 统一 bash 执行（AgentSession.executeBash） |
 | `packages/coding-agent/src/core/event-bus.ts` | 事件总线抽象 |
 | `packages/coding-agent/src/core/pi-manifest.ts` | pi manifest 解析（extensions/skills 配置） |
