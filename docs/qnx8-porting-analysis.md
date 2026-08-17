@@ -95,7 +95,7 @@
    source /path/to/qnxsdp-env.sh                # 初始化 QNX SDP 8.0，qcc 入 PATH
    cargo build --release --target aarch64-unknown-qnx
    ```
-2. **提交 aports PR**：qnx-ports/aports 活跃（nodejs、llama.cpp 均通过 PR 进入）
+2. **提交 aports PR**：qnx-ports/aports 接受外部贡献者（`eleir9268`、`jscaff` 等的 PR 已被合并），只需 `@qnx-ports/aports-admin` 审核，无 CLA 门槛。**注意：aports 目前没有 Rust 工具链**（core/extra 均无 rust/cargo 包），而构建在 QNX target 本机跑 abuild → 直接提交 ripgrep/fd 会因缺少 `cargo` makedepend 无法构建。需先提交 `rust`/`cargo` 包（大工程）或先开 issue 询问维护者是否计划引入（维护者 Aaron Bassett 活跃）
 3. **放 PATH 即可**：`getToolPath()` 先查系统 PATH 再尝试下载（`tools-manager.ts`），rg/fd 存在于 PATH 即被使用
 
 注意：若 `process.platform === "qnx"`，`getAssetName()` 对未知平台返回 `null` → 自动下载被跳过，不会误下载 linux 二进制。
