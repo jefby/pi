@@ -75,8 +75,8 @@
 
 | 工具 | 上游源码 | 本地副本 |
 |------|----------|----------|
-| ripgrep (rg) | https://github.com/BurntSushi/ripgrep | https://github.com/jefby/XXX（已复制） |
-| fd | https://github.com/sharkdp/fd | https://github.com/jefby/XXX（已复制） |
+| ripgrep (rg) | https://github.com/BurntSushi/ripgrep | https://github.com/jefby/ripgrep（fork，master 分支） |
+| fd | https://github.com/sharkdp/fd | https://github.com/jefby/fd（fork，master 分支） |
 
 （pi 的 `tools-manager.ts` 硬编码了上游仓库：`repo: "BurntSushi/ripgrep"` / `repo: "sharkdp/fd"`）
 
