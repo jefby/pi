@@ -56,7 +56,7 @@
 | 项 | 结论 | 说明 |
 |----|------|------|
 | 运行时 | ✅ | Node 24.14.1 LTS ≥ pi 要求 `>=22.19.0`；`node:sqlite`、`worker_threads`、`AbortSignal.any/timeout`、UDS (`AF_UNIX`)、信号/进程组均可用 |
-| `process.platform` | ✅ 有利 | 返回 `"qnx"` → pi 的 win32/linux 分支都不误命中；`package-manager.ts` 的 `/proc/self/environ` 读取、WSL/剪贴板检测等 linux 专属逻辑被跳过 |
+| `process.platform` | ✅ 有利 | 返回 `"qnx"` → pi 的 win32/linux 分支都不误命中；`package-manager.ts` 的 `/proc/self/environ` 读取、footer-data-provider 的 WSL 检测等 `platform === "linux"` 门控逻辑被跳过 |
 | npm 安装 | ✅ | pi 依赖树全纯 JS + WASM：`@silvia-odwyer/photon-node` 是 WASM（`photon_rs_bg.wasm`）；`@mariozechner/clipboard` 是 optionalDependency（napi 平台预编译，QNX 无则优雅降级）；无 node-gyp 编译 |
 | bash 工具 | ✅ | aports 有 bash 5.3；`shell.ts` 路径 `/bin/bash` → PATH bash → `sh` 兜底成立 |
 | git | ✅ | aports 有 git；footer 分支显示可用 |
@@ -65,7 +65,7 @@
 | TUI | ⚠️ 受限 | kitty keyboard protocol、bracketed paste、终端图片依赖连接的终端模拟器（SSH 登录场景可用）；`native-modifiers.ts` 无 QNX 预编译 → `isNativeModifierPressed` 恒 false，降级不崩溃 |
 | 剪贴板 | ⚠️ 降级 | `clipboard-native.ts` 依赖 `@mariozechner/clipboard`，QNX 无预编译 → 返回 null |
 | headless 模式 | ✅ | `--mode rpc / print / json` 不依赖 TUI |
-| OAuth | ⚠️ 需验证 | 无浏览器环境需走 device code 流程（具体 provider 逐个确认） |
+| OAuth | ⚠️ 需验证 | 无浏览器环境需走 device code 流程；Copilot/Radius/Kimi 已有实现（`packages/ai/src/auth/oauth/device-code.ts`，github-copilot 轮询带 429 重试），其余 provider 逐个确认 |
 
 ## 剩余缺口与解决路径
 
@@ -96,7 +96,7 @@
    cargo build --release --target aarch64-unknown-qnx
    ```
 2. **提交 aports PR**：qnx-ports/aports 接受外部贡献者（`eleir9268`、`jscaff` 等的 PR 已被合并），只需 `@qnx-ports/aports-admin` 审核，无 CLA 门槛。**注意：aports 目前没有 Rust 工具链**（core/extra 均无 rust/cargo 包），而构建在 QNX target 本机跑 abuild → 直接提交 ripgrep/fd 会因缺少 `cargo` makedepend 无法构建。需先提交 `rust`/`cargo` 包（大工程）或先开 issue 询问维护者是否计划引入（维护者 Aaron Bassett 活跃）
-3. **放 PATH 即可**：`getToolPath()` 先查系统 PATH 再尝试下载（`tools-manager.ts`），rg/fd 存在于 PATH 即被使用
+3. **放 PATH 即可**：`getToolPath()` 依次查本地 tools 目录、系统 PATH，均未命中才由 `ensureTool()` 触发下载（`tools-manager.ts`）；rg/fd 存在于 PATH 即被直接使用，无需下载
 
 注意：若 `process.platform === "qnx"`，`getAssetName()` 对未知平台返回 `null` → 自动下载被跳过，不会误下载 linux 二进制。
 
