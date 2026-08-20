@@ -7,9 +7,9 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
-import type { AssistantMessage, ImageContent, Message, Model } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, ImageContent, Message, Model, Usage } from "@earendil-works/pi-ai/compat";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -58,6 +58,7 @@ import {
 } from "../../config.ts";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
+import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
 	CACHE_TTL_MS,
 	type CacheMiss,
@@ -65,6 +66,7 @@ import {
 	computeCacheWaste,
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
+import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "../../core/defaults.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -146,6 +148,7 @@ import {
 	type StatusIndicator,
 	WorkingStatusIndicator,
 } from "./components/status-indicator.ts";
+import { ThinkingSelectorComponent } from "./components/thinking-selector.ts";
 import { ToolExecutionComponent } from "./components/tool-execution.ts";
 import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
@@ -204,10 +207,20 @@ type CompactionQueuedMessage = {
 	mode: "steer" | "followUp";
 };
 
-type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }>;
+type CompactionCostNotice = {
+	type: "compaction_cost";
+	kind: "compaction" | "branch_summary";
+	usage: Usage;
+};
+
+type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }> | CompactionCostNotice;
 
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";
+}
+
+function isCompactionCostNotice(item: RenderSessionItem): item is CompactionCostNotice {
+	return "type" in item && item.type === "compaction_cost";
 }
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
@@ -322,6 +335,8 @@ function formatLoginProviderCompletionDescription(provider: LoginProviderComplet
 export interface InteractiveModeOptions {
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
+	/** Diagnostics collected before the interactive TUI was initialized. */
+	startupDiagnostics?: AgentSessionRuntimeDiagnostic[];
 	/** Warning message if session model couldn't be restored */
 	modelFallbackMessage?: string;
 	/** Cwd to trust after reload if it gained a .pi directory during this implicitly trusted session. */
@@ -688,6 +703,21 @@ export class InteractiveMode {
 					label: item.id,
 					description: item.provider,
 				}));
+			};
+		}
+
+		const thinkingCommand = slashCommands.find((command) => command.name === "thinking");
+		if (thinkingCommand) {
+			thinkingCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
+				return createFuzzyAutocompleteItems(
+					this.session.getAvailableThinkingLevels(),
+					prefix,
+					(level) => level,
+					(level) => ({
+						value: level,
+						label: level,
+					}),
+				);
 			};
 		}
 
@@ -1080,7 +1110,24 @@ export class InteractiveMode {
 		});
 
 		// Show startup warnings
-		const { migratedProviders, modelFallbackMessage, initialMessage, initialImages, initialMessages } = this.options;
+		const {
+			migratedProviders,
+			startupDiagnostics,
+			modelFallbackMessage,
+			initialMessage,
+			initialImages,
+			initialMessages,
+		} = this.options;
+
+		for (const diagnostic of startupDiagnostics ?? []) {
+			if (diagnostic.type === "error") {
+				this.showError(diagnostic.message);
+			} else if (diagnostic.type === "warning") {
+				this.showWarning(diagnostic.message);
+			} else {
+				this.showStatus(diagnostic.message);
+			}
+		}
 
 		if (migratedProviders && migratedProviders.length > 0) {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
@@ -2925,6 +2972,12 @@ export class InteractiveMode {
 				await this.handleModelCommand(searchTerm);
 				return;
 			}
+			if (text === "/thinking" || text.startsWith("/thinking ")) {
+				const searchTerm = text.startsWith("/thinking ") ? text.slice(10).trim() : undefined;
+				this.editor.setText("");
+				this.handleThinkingCommand(searchTerm);
+				return;
+			}
 			if (text === "/export" || text.startsWith("/export ")) {
 				await this.handleExportCommand(text);
 				this.editor.setText("");
@@ -3349,8 +3402,13 @@ export class InteractiveMode {
 						this.showStatus("Auto-compaction cancelled");
 					}
 				} else if (event.result) {
+					const entries = this.sessionManager.buildContextEntries();
+					if (entries[0]?.type !== "compaction") {
+						throw new Error("Completed compaction is missing from the session context");
+					}
 					this.chatContainer.clear();
-					this.rebuildChatFromMessages();
+					// The latest compaction is prepended for model context; append it below at its chronological position.
+					this.renderSessionEntries(entries.slice(1));
 					this.addMessageToChat(
 						createCompactionSummaryMessage(
 							event.result.summary,
@@ -3358,6 +3416,13 @@ export class InteractiveMode {
 							new Date().toISOString(),
 						),
 					);
+					if (event.result.usage) {
+						this.addCompactionCostNotice({
+							type: "compaction_cost",
+							kind: "compaction",
+							usage: event.result.usage,
+						});
+					}
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
@@ -3629,6 +3694,10 @@ export class InteractiveMode {
 				this.addCustomEntryToChat(item);
 				continue;
 			}
+			if (isCompactionCostNotice(item)) {
+				this.addCompactionCostNotice(item);
+				continue;
+			}
 
 			const message = item;
 			// Assistant messages need special handling for tool calls
@@ -3706,9 +3775,30 @@ export class InteractiveMode {
 			if (entry.type === "custom") {
 				return [entry];
 			}
-			return sessionEntryToContextMessages(entry);
+			const messages = sessionEntryToContextMessages(entry);
+			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
+				return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
+			}
+			return messages;
 		});
 		this.renderSessionItems(items, options);
+	}
+
+	/**
+	 * Render billing usage for a compaction or branch summary. The notice is derived
+	 * from persisted summary usage and is not stored as a separate session entry.
+	 */
+	private addCompactionCostNotice(notice: CompactionCostNotice): void {
+		if (!this.settingsManager.getShowCacheMissNotices()) return;
+
+		const { usage } = notice;
+		const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+		const cost = usage.cost.total >= 0.01 ? ` (~$${usage.cost.total.toFixed(2)})` : "";
+		const label = notice.kind === "compaction" ? "Compaction" : "Branch summary";
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(
+			new Text(theme.fg("warning", `${label}: ${formatTokens(tokens)} tokens billed${cost}`), 1, 0),
+		);
 	}
 
 	/**
@@ -4426,9 +4516,15 @@ export class InteractiveMode {
 	private showSettingsSelector(): void {
 		this.showSelector((done) => {
 			let selector: SettingsSelectorComponent | undefined;
+			const defaultProvider = this.settingsManager.getDefaultProvider();
+			const defaultModelId = this.settingsManager.getDefaultModel();
+			const defaultModel = defaultProvider && defaultModelId ? `${defaultProvider}/${defaultModelId}` : "not set";
 			selector = new SettingsSelectorComponent(
 				{
 					autoCompact: this.session.autoCompactionEnabled,
+					defaultModel,
+					currentModel: this.session.model,
+					availableDefaultModels: this.session.modelRuntime.getAvailableSnapshot(),
 					showImages: this.settingsManager.getShowImages(),
 					imageWidthCells: this.settingsManager.getImageWidthCells(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
@@ -4438,8 +4534,9 @@ export class InteractiveMode {
 					followUpMode: this.session.followUpMode,
 					transport: this.settingsManager.getTransport(),
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
-					thinkingLevel: this.session.thinkingLevel,
-					availableThinkingLevels: this.session.getAvailableThinkingLevels(),
+					thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
+					availableThinkingLevels: [...THINKING_LEVEL_OPTIONS],
+					modelThinkingLevels: this.settingsManager.getAllModelThinkingLevels(),
 					currentTheme: this.themeController.getThemeSelection() || "dark",
 					terminalTheme: this.themeController.getTerminalTheme(),
 					availableThemes: getAvailableThemes(),
@@ -4509,10 +4606,26 @@ export class InteractiveMode {
 						configureHttpDispatcher(timeoutMs);
 						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
 					},
-					onThinkingLevelChange: (level) => {
-						this.session.setThinkingLevel(level);
-						this.footer.invalidate();
-						this.updateEditorBorderColor();
+					onModelThinkingLevelChange: (provider, modelId, level) => {
+						this.settingsManager.setModelThinkingLevel(provider, modelId, level);
+						// If the override is for the current model, apply it to the session too
+						const current = this.session.model;
+						if (current && current.provider === provider && current.id === modelId) {
+							this.session.setThinkingLevel(level);
+							this.footer.invalidate();
+							this.updateEditorBorderColor();
+						}
+					},
+					onModelThinkingLevelRemove: (provider, modelId) => {
+						this.settingsManager.removeModelThinkingLevel(provider, modelId);
+						// If the override was for the current model, revert to global default
+						const current = this.session.model;
+						if (current && current.provider === provider && current.id === modelId) {
+							const globalDefault = this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+							this.session.setThinkingLevel(globalDefault);
+							this.footer.invalidate();
+							this.updateEditorBorderColor();
+						}
 					},
 					onThemeChange: (themeSetting) => {
 						this.settingsManager.setTheme(themeSetting);
@@ -4636,6 +4749,55 @@ export class InteractiveMode {
 		});
 	}
 
+	private handleThinkingCommand(searchTerm?: string): void {
+		const availableLevels = this.session.getAvailableThinkingLevels();
+		if (!searchTerm) {
+			this.showThinkingSelector();
+			return;
+		}
+
+		const normalized = searchTerm.trim().toLowerCase();
+		const level = availableLevels.find((candidate) => candidate.toLowerCase() === normalized);
+		if (!level) {
+			this.showError(`Unknown thinking level "${searchTerm}". Available levels: ${availableLevels.join(", ")}.`);
+			return;
+		}
+
+		this.selectThinkingLevel(level, false);
+	}
+
+	private selectThinkingLevel(level: ThinkingLevel, persist: boolean): void {
+		try {
+			this.session.setThinkingLevel(level, { persist });
+			this.footer.invalidate();
+			this.updateEditorBorderColor();
+			this.showStatus(persist ? `Default thinking level: ${level}` : `Thinking level: ${level}`);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private showThinkingSelector(): void {
+		this.showSelector((done) => {
+			const selectLevel = (level: ThinkingLevel, persist: boolean) => {
+				this.selectThinkingLevel(level, persist);
+				done();
+			};
+			const selector = new ThinkingSelectorComponent(
+				this.session.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
+				this.session.getAvailableThinkingLevels(),
+				(level) => selectLevel(level, false),
+				() => {
+					done();
+					this.ui.requestRender();
+				},
+				(level) => selectLevel(level, true),
+				this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
+			);
+			return { component: selector, focus: selector };
+		});
+	}
+
 	private async handleModelCommand(searchTerm?: string): Promise<void> {
 		if (!searchTerm) {
 			this.showModelSelector();
@@ -4645,7 +4807,7 @@ export class InteractiveMode {
 		const model = await this.findExactModelMatch(searchTerm);
 		if (model) {
 			try {
-				await this.session.setModel(model);
+				await this.session.setModel(model, { persist: false });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.showStatus(`Model: ${model.id}`);
@@ -4787,31 +4949,35 @@ export class InteractiveMode {
 
 	private showModelSelector(initialSearchInput?: string): void {
 		this.showSelector((done) => {
+			const selectModel = async (model: Model<any>, persist: boolean) => {
+				try {
+					await this.session.setModel(model, { persist });
+					this.footer.invalidate();
+					this.updateEditorBorderColor();
+					done();
+					this.showStatus(persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`);
+					void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+					this.checkDaxnutsEasterEgg(model);
+				} catch (error) {
+					done();
+					this.showError(error instanceof Error ? error.message : String(error));
+				}
+			};
+			const defaultProvider = this.settingsManager.getDefaultProvider();
+			const defaultModel = this.settingsManager.getDefaultModel();
 			const selector = new ModelSelectorComponent(
 				this.ui,
 				this.session.model,
-				this.settingsManager,
 				this.session.modelRuntime,
 				this.session.scopedModels,
-				async (model) => {
-					try {
-						await this.session.setModel(model);
-						this.footer.invalidate();
-						this.updateEditorBorderColor();
-						done();
-						this.showStatus(`Model: ${model.id}`);
-						void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
-						this.checkDaxnutsEasterEgg(model);
-					} catch (error) {
-						done();
-						this.showError(error instanceof Error ? error.message : String(error));
-					}
-				},
+				(model) => selectModel(model, false),
 				() => {
 					done();
 					this.ui.requestRender();
 				},
 				initialSearchInput,
+				(model) => selectModel(model, true),
+				defaultProvider && defaultModel ? { provider: defaultProvider, id: defaultModel } : undefined,
 			);
 			return { component: selector, focus: selector, dispose: () => selector.dispose() };
 		});
@@ -5491,7 +5657,7 @@ export class InteractiveMode {
 					selectionError = `${actionLabel}, but its default model "${defaultModelId}" is not available. Use /model to select a model.`;
 				} else {
 					try {
-						await this.session.setModel(selectedModel);
+						await this.session.setModel(selectedModel, { persist: true });
 					} catch (error: unknown) {
 						selectedModel = undefined;
 						const errorMessage = error instanceof Error ? error.message : String(error);
