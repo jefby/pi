@@ -57,13 +57,13 @@
 |----|------|------|
 | 运行时 | ✅ | Node 24.14.1 LTS ≥ pi 要求 `>=22.19.0`；`node:sqlite`、`worker_threads`、`AbortSignal.any/timeout`、UDS (`AF_UNIX`)、信号/进程组均可用 |
 | `process.platform` | ✅ 有利 | 返回 `"qnx"` → pi 的 win32/linux 分支都不误命中；`package-manager.ts` 的 `/proc/self/environ` 读取、footer-data-provider 的 WSL 检测等 `platform === "linux"` 门控逻辑被跳过 |
-| npm 安装 | ✅ | pi 依赖树全纯 JS + WASM：`@silvia-odwyer/photon-node` 是 WASM（`photon_rs_bg.wasm`）；`@mariozechner/clipboard` 是 optionalDependency（napi 平台预编译，QNX 无则优雅降级）；无 node-gyp 编译 |
+| npm 安装 | ✅ | Node 分发为 esbuild 单文件 bundle（bin → `dist/bundle/cli.js`，纯 ESM）；依赖树全纯 JS + WASM（`@silvia-odwyer/photon-node` 是 WASM，`photon_rs_bg.wasm`）；原生能力（剪贴板/修饰键）由 `@earendil-works/pi-tui` 随包预编译 `.node` prebuilds 提供（仅 darwin/win32/linux-X11，安装时无需编译），QNX 被平台门控跳过、优雅降级（`@mariozechner/clipboard` 已在 #9163 移除） |
 | bash 工具 | ✅ | aports 有 bash 5.3；`shell.ts` 路径 `/bin/bash` → PATH bash → `sh` 兜底成立 |
 | git | ✅ | aports 有 git；footer 分支显示可用 |
 | grep 工具 | ❌ 硬缺口 | 需要 `rg`；pi 的自动下载（`tools-manager.ts`）只支持 darwin/linux/win32 资产 |
 | find 工具 | ⚠️ 缺口 | 需要 `fd`（有 `systemBinaryNames` 可先用系统命令） |
-| TUI | ⚠️ 受限 | kitty keyboard protocol、bracketed paste、终端图片依赖连接的终端模拟器（SSH 登录场景可用）；`native-modifiers.ts` 无 QNX 预编译 → `isNativeModifierPressed` 恒 false，降级不崩溃 |
-| 剪贴板 | ⚠️ 降级 | `clipboard-native.ts` 依赖 `@mariozechner/clipboard`，QNX 无预编译 → 返回 null |
+| TUI | ⚠️ 受限 | kitty keyboard protocol、bracketed paste、终端图片依赖连接的终端模拟器（SSH 登录场景可用）；修饰键 native helper（`native-platform.ts`）平台门控仅 darwin/win32 → QNX 下 `isNativeModifierPressed` 恒 false，降级不崩溃 |
+| 剪贴板 | ⚠️ 降级 | `clipboard.ts`：native（pi-tui，无 QNX prebuild）→ 平台命令（xclip/xsel/wl-copy/pbcopy/clip）→ **OSC 52 终端回退**；QNX 无 X11/Wayland 工具，SSH 终端会话下 copy 走 OSC 52 可用，read 返回 null |
 | headless 模式 | ✅ | `--mode rpc / print / json` 不依赖 TUI |
 | OAuth | ⚠️ 需验证 | 无浏览器环境需走 device code 流程；Copilot/Radius/Kimi 已有实现（`packages/ai/src/auth/oauth/device-code.ts`，github-copilot 轮询带 429 重试），其余 provider 逐个确认 |
 
@@ -98,7 +98,7 @@
 2. **提交 aports PR**：qnx-ports/aports 接受外部贡献者（`eleir9268`、`jscaff` 等的 PR 已被合并），只需 `@qnx-ports/aports-admin` 审核，无 CLA 门槛。**注意：aports 目前没有 Rust 工具链**（core/extra 均无 rust/cargo 包），而构建在 QNX target 本机跑 abuild → 直接提交 ripgrep/fd 会因缺少 `cargo` makedepend 无法构建。需先提交 `rust`/`cargo` 包（大工程）或先开 issue 询问维护者是否计划引入（维护者 Aaron Bassett 活跃）
 3. **放 PATH 即可**：`getToolPath()` 依次查本地 tools 目录、系统 PATH，均未命中才由 `ensureTool()` 触发下载（`tools-manager.ts`）；rg/fd 存在于 PATH 即被直接使用，无需下载
 
-注意：若 `process.platform === "qnx"`，`getAssetName()` 对未知平台返回 `null` → 自动下载被跳过，不会误下载 linux 二进制。
+注意：若 `process.platform === "qnx"`，`getAssetName()` 对未知平台返回 `null` → 自动下载被跳过，不会误下载 linux 二进制（`ensureTool()` 捕获后仅给出 warning，grep/find 功能降级不崩溃）。离线 QNX 环境可设 `PI_OFFLINE=1` 直接跳过下载尝试，避免每工具最长 120s 的网络超时。
 
 ## 落地步骤
 
@@ -107,7 +107,7 @@
 3. `npm install -g @earendil-works/pi-coding-agent`（纯 JS 包）→ `pi --version` 冒烟
 4. 先跑 headless（`pi -p "..."`），再在 SSH 终端验证交互模式
 5. 处理 OAuth（无浏览器时验证 device code 流程）
-6. 可选用 Node 分发版（`dist/cli.js`）而非 Bun 二进制
+6. 可选用 Node 分发版（`dist/bundle/cli.js`，npm `pi` bin 入口）而非 Bun 二进制
 
 ## 参考链接
 
