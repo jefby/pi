@@ -130,3 +130,24 @@
 
 - 初次分析（未搜索 GitHub 前）曾判断"Node 需自行移植、整体不建议"，该结论已被官方 aports 证据推翻，本文档为修正版。
 - Bun 二进制分发版不适用 QNX（Bun 未移植），使用 Node 分发。
+
+## 上游更新记录（0.85.1 → 2026-09-15）
+
+`v0.85.1`（2026-09-05 发布）之后有约 97 个未发布提交（版本号仍为 0.85.1），与 QNX 部署相关的要点：
+
+### 性能
+
+- **ai `EventStream` 队列 O(n²) → O(1)**（#9055）：原来用 `Array.shift()` 出队（每次 O(n)），改为双栈 `FifoQueue`（均摊 O(1)）；修复工具输出很大时排空 extension 事件流的二次方 CPU 占用
+- **agent JSONL fork 索引内存下降**：每个非空列表只记录"首个仍存活的 append 序号"，不再保留每个存活元素
+- **agent 内存 fork 直接从 live state 构造**：复用同一 fork 策略流式读取，省去整体拷贝/重放
+- **ai Fireworks deferred tool loading**（#9323）：按需加载工具 schema，降低每请求工具负载
+- 已在 0.85.1 中：Node 分发改为 esbuild 单文件 bundle + jiti 延迟到扩展加载 + 罕见语法按需加载（启动优化）；全屏下 Alt+滚轮 5 倍速滚动（#9166）
+
+### 其他（不影响本文档 QNX 结论）
+
+- 剪贴板重构 #9163（`clipboard.ts`：native → 平台命令 → OSC 52），已同步更新本文档剪贴板行
+- 仓库链接改为 `earendil-works/pi`（#9278）
+- coding-agent 运行时依赖升级（chalk 6、undici 8.10.2 等，#9341）
+- 大量 provider/模型修复（Bedrock 缓存计价、DeepSeek `deepseek-flash` 命名、Copilot GPT 走 Responses 等）
+
+> 注：以上均为未发布内容，版本号与行为可能在下一个 release 前变化。
