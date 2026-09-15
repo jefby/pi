@@ -5,7 +5,7 @@
 
 ## 结论
 
-**可行**。核心阻塞（Node.js 运行时）已被 QNX 官方解决：QNX 8.0 通过 apk 提供 Node.js 24.14.1 LTS。主要剩余工作量为 ripgrep/fd 两个外部工具的 QNX 构建，以及实际冒烟验证。
+**可行**。核心阻塞（Node.js 运行时）已被 QNX 官方解决：QNX 8.0 通过 apk 提供 Node.js 24.14.1 LTS。主要剩余工作量为 ripgrep/fd 两个外部工具的 QNX 构建、规避 esbuild 的 postinstall（安装加 `--ignore-scripts`），以及实际冒烟验证。
 
 ### 架构支持（aarch64le）
 
@@ -57,7 +57,7 @@
 |----|------|------|
 | 运行时 | ✅ | Node 24.14.1 LTS ≥ pi 要求 `>=22.19.0`；`node:sqlite`、`worker_threads`、`AbortSignal.any/timeout`、UDS (`AF_UNIX`)、信号/进程组均可用 |
 | `process.platform` | ✅ 有利 | 返回 `"qnx"` → pi 的 win32/linux 分支都不误命中；`package-manager.ts` 的 `/proc/self/environ` 读取、footer-data-provider 的 WSL 检测等 `platform === "linux"` 门控逻辑被跳过 |
-| npm 安装 | ✅ | Node 分发为 esbuild 单文件 bundle（bin → `dist/bundle/cli.js`，纯 ESM）；依赖树全纯 JS + WASM（`@silvia-odwyer/photon-node` 是 WASM，`photon_rs_bg.wasm`）；原生能力（剪贴板/修饰键）由 `@earendil-works/pi-tui` 随包预编译 `.node` prebuilds 提供（仅 darwin/win32/linux-X11，安装时无需编译），QNX 被平台门控跳过、优雅降级（`@mariozechner/clipboard` 已在 #9163 移除） |
+| npm 安装 | ⚠️ 需 `--ignore-scripts` | Node 分发为 esbuild 单文件 bundle（bin → `dist/bundle/cli.js`，纯 ESM）；多数依赖纯 JS + WASM（`@silvia-odwyer/photon-node` 是 WASM；剪贴板/修饰键原生能力由 `@earendil-works/pi-tui` 随包预编译 `.node` 提供，仅 darwin/win32/linux-X11，安装不编译）。但新版 `@earendil-works/chord` 依赖 `esbuild`（带 postinstall，无 qnx 平台包）→ QNX 上直接 `npm install` 会因 esbuild postinstall 抛 `Unsupported platform: qnx ...` 失败，需 `npm install --ignore-scripts`（见下文 esbuild 缺口） |
 | bash 工具 | ✅ | aports 有 bash 5.3；`shell.ts` 路径 `/bin/bash` → PATH bash → `sh` 兜底成立 |
 | git | ✅ | aports 有 git；footer 分支显示可用 |
 | grep 工具 | ❌ 硬缺口 | 需要 `rg`；pi 的自动下载（`tools-manager.ts`）只支持 darwin/linux/win32 资产 |
@@ -69,7 +69,7 @@
 
 ## 剩余缺口与解决路径
 
-### ripgrep / fd（唯一硬缺口）
+### ripgrep / fd（硬缺口）
 
 **源码位置**：
 
@@ -100,11 +100,20 @@
 
 注意：若 `process.platform === "qnx"`，`getAssetName()` 对未知平台返回 `null` → 自动下载被跳过，不会误下载 linux 二进制（`ensureTool()` 捕获后仅给出 warning，grep/find 功能降级不崩溃）。离线 QNX 环境可设 `PI_OFFLINE=1` 直接跳过下载尝试，避免每工具最长 120s 的网络超时。
 
+### esbuild（仅 experimental 功能受影响）
+
+- coding-agent 自 0.85.1 起依赖 `@earendil-works/chord`，chord 又依赖 `esbuild`（用在 `packages/chord/src/node/bundle.ts`，即 `chord/bundler`、`chord/node` 入口）
+- esbuild 0.28.2 带 postinstall（`hasInstallScript: true`），其 `install.js` 按 `process.platform + arch + endianness` 查平台包表；`qnx arm64 LE` / `qnx x64 LE` 不在 `knownUnixlikePackages` 中 → 直接抛 `Unsupported platform: qnx arm64 LE`，导致整个 `npm install` 失败
+- 稳定 `pi` CLI 不加载 chord/esbuild：Node bundle 中 `@earendil-works/chord` 为 external，且只有 `src/experimental/**`（`PI_EXPERIMENTAL=1` 的插件打包 `bundleFacetPackage`、服务模式）会静态 import esbuild
+- 解决：
+  1. **安装加 `--ignore-scripts`**（推荐）：跳过 esbuild 的 postinstall，稳定 CLI 不受影响
+  2. 若需 experimental 插件打包：esbuild 是 Go 程序，可交叉编译到 QNX，再用 `ESBUILD_BINARY_PATH` 指向该二进制（esbuild 的 install.js 与运行时的 JS API 均支持该环境变量覆盖）
+
 ## 落地步骤
 
 1. QNX 8.0 配置 apk 源，`sudo apk add nodejs npm bash git`
 2. 准备 rg/fd（交叉编译或 aports PR）
-3. `npm install -g @earendil-works/pi-coding-agent`（纯 JS 包）→ `pi --version` 冒烟
+3. `npm install -g @earendil-works/pi-coding-agent --ignore-scripts`（见 esbuild 缺口）→ `pi --version` 冒烟
 4. 先跑 headless（`pi -p "..."`），再在 SSH 终端验证交互模式
 5. 处理 OAuth（无浏览器时验证 device code 流程）
 6. 可选用 Node 分发版（`dist/bundle/cli.js`，npm `pi` bin 入口）而非 Bun 二进制
