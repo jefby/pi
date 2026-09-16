@@ -63,7 +63,7 @@
 | grep 工具 | ❌ 硬缺口 | 需要 `rg`；pi 的自动下载（`tools-manager.ts`）只支持 darwin/linux/win32 资产 |
 | find 工具 | ⚠️ 缺口 | 需要 `fd`（有 `systemBinaryNames` 可先用系统命令） |
 | TUI | ⚠️ 受限 | kitty keyboard protocol、bracketed paste、终端图片依赖连接的终端模拟器（SSH 登录场景可用）；修饰键 native helper（`native-platform.ts`）平台门控仅 darwin/win32 → QNX 下 `isNativeModifierPressed` 恒 false，降级不崩溃 |
-| 剪贴板 | ⚠️ 降级 | `clipboard.ts`：native（pi-tui，无 QNX prebuild）→ 平台命令（xclip/xsel/wl-copy/pbcopy/clip）→ **OSC 52 终端回退**；QNX 无 X11/Wayland 工具，SSH 终端会话下 copy 走 OSC 52 可用，read 返回 null |
+| 剪贴板 | ⚠️ 降级 | `clipboard.ts`：native（pi-tui，无 QNX prebuild）→ 平台命令（xclip/xsel/wl-copy/pbcopy/clip）；QNX 无 X11/Wayland 工具，**SSH 远程会话下 `isRemoteSession()` 触发 OSC 52**，本地控制台直接抛 `Clipboard unavailable`；read 返回 null |
 | headless 模式 | ✅ | `--mode rpc / print / json` 不依赖 TUI |
 | OAuth | ⚠️ 需验证 | 无浏览器环境需走 device code 流程；Copilot/Radius/Kimi 已有实现（`packages/ai/src/auth/oauth/device-code.ts`，github-copilot 轮询带 429 重试），其余 provider 逐个确认 |
 
