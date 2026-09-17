@@ -156,7 +156,7 @@ flowchart TB
 - **Node 入口**：`packages/coding-agent/src/cli.ts` → `dist/cli.js`（`bin "pi"`）。
 - **Bun 二进制入口**：编译后的 `dist/pi` 同样进入 `cli.ts`。
 - **Server 入口**：`packages/server/src/cli.ts` → `serve` / `spawn` / `rpc` / `rpc-stream` / `list` / `status` / `stop` 等子命令。
-- **Evals 入口**：根目录 `npm run eval -- --provider <p> --model <m>`，内部调用 `packages/evals/scripts/run-evals.mjs`。
+- **Evals 入口**：`npm run eval -w packages/evals` 依次运行宿主机评测与文档对照评测；后者由 `packages/evals/src/cli.ts` 编排，通过 Docker 隔离运行。模型通过 `PI_PROVIDER` / `PI_MODEL` 指定。
 
 ### 3.2 运行模式
 
@@ -339,6 +339,12 @@ flowchart LR
 
 Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex、Bedrock、Azure OpenAI、Mistral、Cerebras、DeepSeek、Fireworks、Groq、Together、OpenRouter、GitHub Copilot、Cloudflare、Moonshot、Qwen、MiniMax、xAI、ZAI 等数十个 provider，每个 provider 通常包含 `index.ts` 与 `<name>.models.ts` 分别描述能力与模型列表。`images.ts` 与 `image-models.generated.ts` 提供统一的图像生成入口。部分 provider 有特殊行为：xAI 模型统一通过 Responses API 路由（默认 Grok 4.6）；Google 思考级别遵循官方级别映射；Kimi 追踪缓存 token 用量；ZAI 使用中文 Coding Plan 模型目录；废弃的 Xiaomi 模型已移除。
 
+近期提供商兼容与重试行为（截至上游 `5a3a03a7f`）：
+
+- **Google / Vertex 思考级别**：先由 `clampThinkingLevel()` 选择模型支持的级别，再按 `thinkingLevelMap` 映射；两条 API 共用 `google-shared.ts`。例如支持 `medium` 的模型不再被统一提升为 `HIGH`。关闭思考时，支持关闭的模型使用 `thinkingBudget: 0`，不支持的模型使用最低支持级别。
+- **Anthropic 模型标识**：`AssistantMessage.model` 保留请求模型 ID；服务端返回不同名称时另存 `responseModel`，避免别名或回退模型名称变化导致后续 thinking 重放丢失。匹配 `allowedFallbackModels` 时仍使用实际响应模型的费用配置。
+- **暂时性错误识别**：`utils/retry.ts` 将 Cloudflare HTTP 520 和 Azure 的 `currently experiencing high demand` 错误纳入可重试范围；实际重试仍受调用方策略限制。
+
 ### 4.5 工具执行
 
 **文件**：
@@ -437,7 +443,7 @@ flowchart TB
 
 交互式模式数据流：
 
-1. `ProcessTerminal` 启用 raw mode、Kitty keyboard protocol、bracketed paste。
+1. 默认由 `ProcessTerminal` 启用 raw mode、Kitty keyboard protocol、bracketed paste；`InteractiveModeOptions.terminal` 可注入其他 `Terminal` 实现，评测可记录渲染输出而不接管真实终端。
 2. `StdinBuffer` 将原始输入切分为完整按键序列，识别粘贴事件。
 3. `TUI.handleInput()` 将输入路由到当前焦点组件（通常是 `CustomEditor`）。
 4. `CustomEditor` 优先处理应用快捷键（中断、退出、粘贴图片、扩展快捷键），其余交给 `Editor`。
@@ -701,23 +707,33 @@ server rpc-stream <instance-id>
 
 **文件**：
 
-- `packages/evals/src/pi-harness.ts`
-- `packages/evals/src/smoke.eval.ts`
-- `packages/evals/src/extensions.eval.ts`
-- `packages/evals/scripts/run-evals.mjs`
+- `packages/evals/src/harness.ts`
+- `packages/evals/src/cli.ts`、`docker.ts`、`plan.ts`、`report.ts`
+- `packages/evals/evals/smoke.eval.ts`、`documentation-audit.eval.ts`
+- `packages/evals/evals/*.docs.eval.ts`（扩展、模型、Provider、TUI 文档对照评测）
 
 `pi-evals` 是私有包，不发布到 npm，基于 `vitest-evals` 对 `pi-coding-agent` 进行端到端行为评测：
 
-1. `createPiCodingAgentHarness()` 创建隔离临时目录与 `AgentSession`。
-2. 通过 `PI_PROVIDER` / `PI_MODEL` 环境变量指定被测模型。
-3. 执行 prompt 步骤，收集 assistant 输出、工具调用、token 用量。
-4. 将结果归一化为 `TranscriptEvent` 与 usage 统计，供 `vitest-evals` 评分。
+1. `createPiCodingAgentHarness()` 创建隔离临时目录与 `AgentSession`，通过显式模型选项或 `PI_PROVIDER` / `PI_MODEL` 选择模型。
+2. 执行 `prompt` / `reload` 步骤，收集 assistant 输出、工具调用、token 用量与会话快照。
+3. 从 `session.messages` 中用 `getCurrentSystemPrompt()` 提取实际对话中的系统提示词，校验规则与文档段，而不是读取 reload 后可能重建的 `session.systemPrompt`。
+4. 将结果归一化为 `TranscriptEvent` 与 usage 统计，供 `vitest-evals` 评分。运行后校验或输出处理失败时，已收集的事件、用量与提示词摘要仍附在部分运行结果中；报告保留可读取的指标，但将该次运行标记为 `errored`。
 
-运行方式：
+文档对照评测由 `cli.ts` 为每个用例规划 `without_docs` / `with_docs` 两组运行，在独立 Docker 容器中执行，比较有无 Pi 文档时的得分。`createPiDocumentationEvalHarness()` 默认仅提供文件读写与搜索工具，不暴露 bash；它要求容器环境及非特权用户沙箱。缺失、出错或无分数的配对不计入成功率提升，并阻止发布整体提升指标。
+
+TUI 用例 `tui.docs.eval.ts` 要求模型编写上下文进度条扩展，reload 后注入 `RecordingTerminal`，采集真实 `InteractiveMode` 渲染。它检查 42.2%、65%、120% 三组上下文用量，验证十格进度条及 0–100% 截断，并用 `autoevals` 的 Levenshtein 相似度记录其余状态文本的保留程度；这不是将进度条直接加入内置 footer。
+
+运行方式（会调用真实模型；文档对照还需要 Docker）：
 
 ```bash
-npm run eval -- --provider <provider> --model <model>
+# 宿主机评测，然后运行文档对照
+PI_PROVIDER=<provider> PI_MODEL=<model> npm run eval -w packages/evals
+
+# 仅运行文档对照
+npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 ```
+
+对照产物写入 `packages/evals/.eval/<timestamp>_<id>/`，包含运行计划、规范化观察结果、原生会话文件及 `report.json` / `report.txt`。
 
 ---
 
@@ -1008,10 +1024,14 @@ npm run eval -- --provider <provider> --model <model>
 
 | 文件 | 职责 |
 |------|------|
-| `packages/evals/src/pi-harness.ts` | Pi coding-agent 的 vitest-evals harness |
-| `packages/evals/src/smoke.eval.ts` | 冒烟评测用例 |
-| `packages/evals/src/extensions.eval.ts` | 扩展系统评测用例 |
-| `packages/evals/scripts/run-evals.mjs` | 评测运行入口 |
+| `packages/evals/src/harness.ts` | Pi coding-agent 评测适配器、提示词校验与部分运行诊断 |
+| `packages/evals/src/cli.ts` | 文档对照评测入口与运行编排 |
+| `packages/evals/src/docker.ts` | 隔离镜像构建、用例发现与容器执行 |
+| `packages/evals/src/plan.ts` | 用例、文档变体及重复运行计划 |
+| `packages/evals/src/report.ts` | 读取运行结果、配对比较与指标汇总 |
+| `packages/evals/evals/smoke.eval.ts` | 宿主机冒烟评测用例 |
+| `packages/evals/evals/extensions.docs.eval.ts` | 扩展系统文档对照评测 |
+| `packages/evals/evals/tui.docs.eval.ts` | 注入终端并验证上下文 footer 扩展 |
 
 ---
 
