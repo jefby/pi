@@ -28,9 +28,13 @@ export type KnownApi =
 
 export type Api = KnownApi | (string & {});
 
-export type KnownImagesApi = "openrouter-images";
+export type KnownImageApi = "openrouter-images";
 
-export type ImagesApi = KnownImagesApi | (string & {});
+export type ImageApi = KnownImageApi | (string & {});
+
+export type KnownClassifierApi = "typesafe-system-one" | "cloudflare-workers-ai-system-one";
+
+export type ClassifierApi = KnownClassifierApi | (string & {});
 
 export type KnownProvider =
 	| "amazon-bedrock"
@@ -42,6 +46,7 @@ export type KnownProvider =
 	| "azure-openai-responses"
 	| "openai-codex"
 	| "radius"
+	| "typesafe"
 	| "nvidia"
 	| "deepseek"
 	| "github-copilot"
@@ -64,6 +69,7 @@ export type KnownProvider =
 	| "opencode"
 	| "opencode-go"
 	| "kimi-coding"
+	| "meta"
 	| "cloudflare-workers-ai"
 	| "cloudflare-ai-gateway"
 	| "qwen-token-plan"
@@ -74,10 +80,6 @@ export type KnownProvider =
 	| "xiaomi-token-plan-ams"
 	| "xiaomi-token-plan-sgp";
 export type ProviderId = KnownProvider | string;
-
-export type KnownImagesProvider = "openrouter";
-
-export type ImagesProviderId = KnownImagesProvider | string;
 
 export type ToolChoice = "auto" | "none";
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -106,6 +108,12 @@ export interface ThinkingBudgets {
 
 // Base options all providers share
 export type CacheRetention = "none" | "short" | "long";
+
+/**
+ * Best-effort prompt cache lifetime in seconds for each retention tier a request can ask for.
+ * A missing tier means the lifetime is unknown; pi does not warm such caches.
+ */
+export type ModelPromptCache = Partial<Record<Exclude<CacheRetention, "none">, number>>;
 
 export type Transport = "sse" | "websocket" | "websocket-cached" | "auto";
 
@@ -182,6 +190,12 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	 * its body stream is consumed.
 	 */
 	onResponse?: (response: ProviderResponse, model: Model<Api>) => void | Promise<void>;
+	/**
+	 * Optional observer for each parsed provider stream event before Pi normalization.
+	 * Event data is adapter-owned and must be treated as read-only.
+	 * Adapter support is explicit; unsupported adapters do not invoke it.
+	 */
+	onProviderStreamEvent?: (data: unknown, model: Model<Api>) => void | Promise<void>;
 	temperature?: number;
 	/**
 	 * Arbitrary sampling parameters merged into the request body as-is, after the named request
@@ -287,18 +301,29 @@ export interface ProviderStreams {
 /**
  * The uniform contract of an image-generation API implementation module:
  * every image API module under `src/api/` exports exactly `generateImages`,
- * so the module itself satisfies this interface. Lazy wrappers and image
- * provider factories pass these around as values.
+ * so the module itself satisfies this interface. Lazy wrappers and
+ * `createProvider({ images })` pass these around as values.
  */
 export interface ProviderImages {
 	generateImages(
-		model: ImagesModel<ImagesApi>,
+		model: ImageModel<ImageApi>,
 		context: ImagesContext,
 		options?: ImagesOptions,
 	): Promise<AssistantImages>;
 }
 
-export interface ImagesOptions extends ProviderRequestOptions<ImagesModel<ImagesApi>> {
+/** The uniform contract implemented by classifier API modules. */
+export interface ProviderClassifier {
+	classify(
+		model: ClassifierModel<ClassifierApi>,
+		context: ClassifierContext,
+		options?: ClassifierOptions,
+	): Promise<ClassifierResult>;
+}
+
+export interface ClassifierOptions extends ProviderRequestOptions<ClassifierModel<ClassifierApi>> {}
+
+export interface ImagesOptions extends ProviderRequestOptions<ImageModel<ImageApi>> {
 	/**
 	 * Optional metadata to include in API requests.
 	 * Providers extract the fields they understand and ignore the rest.
@@ -342,11 +367,17 @@ export type StreamFunction<TApi extends Api = Api, TOptions extends StreamOption
 	options?: TOptions,
 ) => AssistantMessageEventStream;
 
-export type ImagesFunction<TApi extends ImagesApi = ImagesApi, TOptions extends ImagesOptions = ImagesOptions> = (
-	model: ImagesModel<TApi>,
+export type ImagesFunction<TOptions extends ImagesOptions = ImagesOptions> = (
+	model: ImageModel<ImageApi>,
 	context: ImagesContext,
 	options?: TOptions,
 ) => Promise<AssistantImages>;
+
+export type ClassifierFunction<TOptions extends ClassifierOptions = ClassifierOptions> = (
+	model: ClassifierModel<ClassifierApi>,
+	context: ClassifierContext,
+	options?: TOptions,
+) => Promise<ClassifierResult>;
 
 export interface TextSignatureV1 {
 	v: 1;
@@ -380,7 +411,7 @@ export interface ToolCall {
 	type: "toolCall";
 	id: string;
 	name: string;
-	arguments: Record<string, any>;
+	arguments: JsonObject;
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
 	/** OpenAI Responses namespace for calls to dynamically loaded or namespaced tools. */
 	namespace?: string;
@@ -411,7 +442,53 @@ export interface Usage {
 
 export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
 
-export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export type JsonValue = null | boolean | number | string | readonly JsonValue[] | JsonObject;
+export type JsonObject = { [key: string]: JsonValue };
+
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type IsExactlyJsonValue<T> = [T] extends [JsonValue] ? ([JsonValue] extends [T] ? true : false) : false;
+type IsJsonProperty<T> = IsAny<T> extends true
+	? false
+	: unknown extends T
+		? false
+		: [Exclude<T, undefined>] extends [never]
+			? true
+			: IsJsonCompatible<Exclude<T, undefined>>;
+type InvalidJsonKeys<T extends object> = {
+	[TKey in keyof T]-?: TKey extends string | number ? (IsJsonProperty<T[TKey]> extends true ? never : TKey) : TKey;
+}[keyof T];
+type IsJsonCompatible<T> = IsAny<T> extends true
+	? false
+	: unknown extends T
+		? false
+		: IsExactlyJsonValue<T> extends true
+			? true
+			: T extends null | boolean | number | string
+				? true
+				: T extends undefined
+					? false
+					: T extends readonly (infer TItem)[]
+						? IsJsonCompatible<TItem>
+						: T extends (...args: never[]) => unknown
+							? false
+							: T extends object
+								? [InvalidJsonKeys<T>] extends [never]
+									? true
+									: false
+								: false;
+
+/** The JSON representation of a typed in-memory value. Optional object properties remain optional. */
+export type JsonRepresentation<T> = IsAny<T> extends true
+	? JsonValue
+	: unknown extends T
+		? JsonValue
+		: [T] extends [JsonValue]
+			? T
+			: T extends readonly unknown[]
+				? { [TKey in keyof T]: JsonRepresentation<Exclude<T[TKey], undefined>> }
+				: T extends object
+					? { [TKey in keyof T]: JsonRepresentation<Exclude<T[TKey], undefined>> }
+					: never;
 
 export interface DeferredHandle {
 	provider: string;
@@ -431,11 +508,9 @@ export interface DeferredHandle {
  * The leading system message is the system prompt. Later system messages change it:
  * `content` adds instructions from that point on, `sections` replace or remove named
  * prompt sections, and `toolsAdded`/`toolsRemoved` change the tool set. Replaying
- * every system message in order yields the current prompt and tools. A message with
- * `replace` discards the replayed state first, so it is a complete new baseline.
- * Providers that accept system messages mid-conversation send each one in place; other
- * providers, and every provider after a replacement, rebuild the leading system message
- * from the replayed state.
+ * every system message in order yields the current prompt and tools. Providers that
+ * accept system messages mid-conversation send each one in place; other providers
+ * rebuild the leading system message from the replayed state.
  */
 export interface SystemMessage {
 	role: "system";
@@ -452,11 +527,6 @@ export interface SystemMessage {
 	toolsAdded?: Tool[];
 	/** Tools that stop being available at this point. */
 	toolsRemoved?: ToolReference[];
-	/**
-	 * Discard every earlier system message before applying this one, so its `content`,
-	 * `sections`, and `toolsAdded` are the complete prompt and tool state from here on.
-	 */
-	replace?: boolean;
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
@@ -490,17 +560,19 @@ export interface AssistantMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
-export interface ToolResultMessage<TDetails = any> {
-	role: "toolResult";
-	toolCallId: string;
-	toolName: string;
-	content: (TextContent | ImageContent)[]; // Supports text and images
-	details?: TDetails;
-	/** Usage from the tool execution itself, if available. Not part of main LLM context accounting. */
-	usage?: Usage;
-	isError: boolean;
-	timestamp: number; // Unix timestamp in milliseconds
-}
+export type ToolResultMessage<TDetails = JsonValue> = IsJsonCompatible<TDetails> extends true
+	? {
+			role: "toolResult";
+			toolCallId: string;
+			toolName: string;
+			content: (TextContent | ImageContent)[]; // Supports text and images
+			details?: JsonRepresentation<TDetails>;
+			/** Usage from the tool execution itself, if available. Not part of main LLM context accounting. */
+			usage?: Usage;
+			isError: boolean;
+			timestamp: number; // Unix timestamp in milliseconds
+		}
+	: never;
 
 export type Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage;
 
@@ -514,13 +586,69 @@ export interface ImagesContext {
 export type ImagesStopReason = "stop" | "error" | "aborted";
 
 export interface AssistantImages {
-	api: ImagesApi;
-	provider: ImagesProviderId;
+	api: ImageApi;
+	provider: ProviderId;
 	model: string;
 	output: ImagesOutputContent[];
 	responseId?: string;
 	usage?: Usage;
 	stopReason: ImagesStopReason;
+	errorMessage?: string;
+	timestamp: number; // Unix timestamp in milliseconds
+}
+
+export interface ClassifierChoiceQuestion {
+	type: "choice";
+	instructions: string;
+	criteria: Record<string, string>;
+}
+
+export interface ClassifierScoreQuestion {
+	type: "score";
+	instructions: string;
+	criteria: string[];
+}
+
+export interface ClassifierBoolQuestion {
+	type: "bool";
+	instructions: string;
+	criteria: { true: string; false: string };
+}
+
+export type ClassifierQuestion = ClassifierChoiceQuestion | ClassifierScoreQuestion | ClassifierBoolQuestion;
+
+export interface ClassifierContext {
+	state: JsonObject;
+	questions: Record<string, ClassifierQuestion>;
+}
+
+export interface ClassifierChoiceAnswer {
+	type: "choice";
+	choice: string;
+	probabilities: Record<string, number>;
+	confidence: number;
+}
+
+export interface ClassifierScoreAnswer {
+	type: "score";
+	score: number;
+	confidence: number;
+}
+
+export interface ClassifierBoolAnswer {
+	type: "bool";
+	probability: number;
+}
+
+export type ClassifierAnswer = ClassifierChoiceAnswer | ClassifierScoreAnswer | ClassifierBoolAnswer;
+export type ClassifierStopReason = "stop" | "error" | "aborted";
+
+export interface ClassifierResult {
+	api: ClassifierApi;
+	provider: ProviderId;
+	model: string;
+	answers: Record<string, ClassifierAnswer>;
+	stopReason: ClassifierStopReason;
 	errorMessage?: string;
 	timestamp: number; // Unix timestamp in milliseconds
 }
@@ -683,7 +811,7 @@ export interface OpenAICompletionsCompat {
 	supportsMidConvoSystemMessages?: boolean;
 	/** Whether system messages can introduce additional tools mid-conversation. Requires `supportsMidConvoSystemMessages`. Default: false; the generated model catalog enables it for capable models. */
 	supportsMidConvoToolAdditions?: boolean;
-	/** Whether the provider supports the `strict` field in tool definitions. Default: true. */
+	/** Whether the provider supports the `strict` field in tool definitions. Default: false; generated capable models enable it explicitly. */
 	supportsStrictMode?: boolean;
 	/** Cache control convention for prompt caching. "anthropic" applies Anthropic-style `cache_control` markers to the system prompt, last tool definition, and last user, assistant, or tool-result text content. */
 	cacheControlFormat?: "anthropic";
@@ -907,26 +1035,63 @@ export interface ModelCost extends ModelCostRates {
 	tiers?: ModelCostTier[];
 }
 
-// Model interface for the unified model system
-export interface Model<TApi extends Api> {
+export interface ModelImageResizeOptions {
+	maxWidth?: number;
+	maxHeight?: number;
+	/** Maximum base64-encoded payload size in bytes. */
+	maxBytes?: number;
+	jpegQuality?: number;
+}
+
+export interface ModelImageInputLimits {
+	/** Cache-safe resize profile applied before a new image enters conversation history. */
+	resize?: ModelImageResizeOptions;
+	/** Maximum images accepted in one provider message. */
+	maxPerMessage?: number;
+	/** Maximum images accepted across one provider request. */
+	maxPerRequest?: number;
+}
+
+export interface ModelInputLimits {
+	/** Maximum serialized provider request size in bytes. */
+	maxRequestBytes?: number;
+	images?: ModelImageInputLimits;
+}
+
+/** Fields shared by every catalog entry, regardless of what you can do with it. */
+export interface BaseModel<TApi extends string> {
 	id: string;
 	name: string;
 	api: TApi;
 	provider: ProviderId;
 	baseUrl: string;
+	input: ("text" | "image")[];
+	/** Provider input limits and cache-safe preprocessing metadata. */
+	inputLimits?: ModelInputLimits;
+	cost: ModelCost;
+	headers?: Record<string, string>;
+}
+
+/** Chat model: usable with `stream()` and friends. */
+export interface Model<TApi extends Api> extends BaseModel<TApi> {
+	/**
+	 * Optional: chat is the default model type, so models without `type` are chat
+	 * models. Narrow mixed model lists with `isModelType()` instead of comparing
+	 * `type` directly.
+	 */
+	type?: "chat";
 	reasoning: boolean;
 	/**
 	 * Maps pi thinking levels to provider/model-specific values.
 	 * Missing keys use provider defaults. null marks a level as unsupported.
 	 */
 	thinkingLevelMap?: ThinkingLevelMap;
-	input: ("text" | "image")[];
-	cost: ModelCost;
+	/** Prompt cache lifetimes per retention tier. Unset when the provider's cache behavior is unknown. */
+	promptCache?: ModelPromptCache;
 	contextWindow: number;
 	maxTokens: number;
 	/** Default sampling parameters for this model. See {@link StreamOptions.samplingParams}; per-request keys override these. */
 	samplingParams?: Record<string, unknown>;
-	headers?: Record<string, string>;
 	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
 	compat?: TApi extends "openai-completions"
 		? OpenAICompletionsCompat
@@ -941,9 +1106,28 @@ export interface Model<TApi extends Api> {
 						: never;
 }
 
-export interface ImagesModel<TApi extends ImagesApi>
-	extends Omit<Model<Api>, "api" | "provider" | "reasoning" | "contextWindow" | "maxTokens" | "compat"> {
-	api: TApi;
-	provider: ImagesProviderId;
+/** Image-generation model: usable with `generateImages()` only. */
+export interface ImageModel<TApi extends ImageApi> extends BaseModel<TApi> {
+	type: "image";
+	/** Output modalities. Always includes `"image"`; `"text"` means the model can also return text blocks. */
 	output: ("text" | "image")[];
 }
+
+/** Structured classifier model: usable with `classify()` only. */
+export interface ClassifierModel<TApi extends ClassifierApi> extends BaseModel<TApi> {
+	type: "classifier";
+	contextWindow: number;
+}
+
+/** Model shape for each model type. */
+export interface ModelTypeMap {
+	chat: Model<Api>;
+	image: ImageModel<ImageApi>;
+	classifier: ClassifierModel<ClassifierApi>;
+}
+
+/** What a catalog entry is for. Decides which `Models` operation accepts it. */
+export type ModelType = keyof ModelTypeMap;
+
+/** Anything a provider can list. Narrow with `isModelType()`. */
+export type AnyModel = ModelTypeMap[ModelType];

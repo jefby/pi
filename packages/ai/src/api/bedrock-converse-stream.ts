@@ -32,6 +32,8 @@ import type {
 	AssistantMessage,
 	CacheRetention,
 	ImageContent,
+	JsonObject,
+	JsonValue,
 	Model,
 	ProviderEnv,
 	ProviderResponse,
@@ -292,6 +294,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			}
 
 			for await (const item of response.stream!) {
+				await options.onProviderStreamEvent?.(item, model);
 				if (item.messageStart) {
 					if (item.messageStart.role !== ConversationRole.ASSISTANT) {
 						throw new Error("Unexpected assistant message start but got user message start instead");
@@ -437,7 +440,7 @@ function appendBedrockFailureDiagnostic(
 	fallbackRequestId: string | undefined,
 ): void {
 	const metadata = (error as SdkErrorMetadata)?.$metadata;
-	const details: Record<string, unknown> = {};
+	const details: JsonObject = {};
 
 	if (typeof metadata?.httpStatusCode === "number") details.status = metadata.httpStatusCode;
 
@@ -916,7 +919,7 @@ function createRequiredTextBlock(text: string): ContentBlock.TextMember {
 	return createNonBlankTextBlock(text) ?? { text: EMPTY_TEXT_PLACEHOLDER };
 }
 
-function sanitizeBedrockDocument(value: DocumentType): DocumentType {
+function sanitizeBedrockDocument(value: JsonValue): DocumentType {
 	if (Array.isArray(value)) {
 		return value.map(sanitizeBedrockDocument);
 	}

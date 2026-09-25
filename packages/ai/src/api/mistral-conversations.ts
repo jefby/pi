@@ -150,7 +150,7 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 			}
 			const mistralStream = await requestMistralStream(model, payload, apiKey, options);
 			stream.push({ type: "start", partial: output });
-			await consumeChatStream(model, output, stream, mistralStream);
+			await consumeChatStream(model, output, stream, mistralStream, options?.onProviderStreamEvent);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -559,6 +559,7 @@ async function consumeChatStream(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	mistralStream: AsyncIterable<MistralCompletionEvent>,
+	onProviderStreamEvent: StreamOptions["onProviderStreamEvent"],
 ): Promise<void> {
 	let currentBlock: TextContent | ThinkingContent | null = null;
 	const blocks = output.content;
@@ -588,6 +589,7 @@ async function consumeChatStream(
 
 	for await (const event of mistralStream) {
 		const chunk = event.data;
+		await onProviderStreamEvent?.(chunk, model);
 		// Mistral's streamed CompletionChunk carries an id field. Keep the first non-empty one,
 		// mirroring how OpenAI-style streaming exposes a stable response identifier per stream.
 		output.responseId ||= chunk.id;
@@ -721,7 +723,7 @@ async function consumeChatStream(
 					? toolCall.function.arguments
 					: JSON.stringify(toolCall.function.arguments || {});
 			block.partialArgs = (block.partialArgs || "") + argsDelta;
-			block.arguments = parseStreamingJson<Record<string, unknown>>(block.partialArgs);
+			block.arguments = parseStreamingJson<ToolCall["arguments"]>(block.partialArgs);
 			stream.push({
 				type: "toolcall_delta",
 				contentIndex: toolBlocksByKey.get(key)!,
@@ -736,7 +738,7 @@ async function consumeChatStream(
 		const block = output.content[index];
 		if (block.type !== "toolCall") continue;
 		const toolBlock = block as ToolCall & { partialArgs?: string };
-		toolBlock.arguments = parseStreamingJson<Record<string, unknown>>(toolBlock.partialArgs);
+		toolBlock.arguments = parseStreamingJson<ToolCall["arguments"]>(toolBlock.partialArgs);
 		// Finalize in-place and strip the scratch buffer so replay only
 		// carries parsed arguments.
 		delete toolBlock.partialArgs;
