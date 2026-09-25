@@ -1,6 +1,6 @@
 # Pi → QNX 8.0 移植可行性分析
 
-> 分析日期：2026-08（基于 GitHub 公开仓库证据）；代码增量核对至 2026-09-17，上游 `5a3a03a7f`。外部 QNX 运行时与工具链结论未在本轮重新验证。
+> 分析日期：2026-08（基于 GitHub 公开仓库证据）；代码增量核对至 2026-09-25，上游 `5fd446ca1`（v0.87.1）。外部 QNX 运行时与工具链结论未在本轮重新验证。
 > 范围：将 pi monorepo（`packages/coding-agent` 主 CLI/SDK）移植到 QNX Neutrino 8.0（x86_64 与 aarch64le 均适用）
 
 ## 结论
@@ -63,7 +63,7 @@
 | grep 工具 | ❌ 硬缺口 | 需要 `rg`；pi 的自动下载（`tools-manager.ts`）只支持 darwin/linux/win32 资产 |
 | find 工具 | ⚠️ 缺口 | 需要 `fd`（有 `systemBinaryNames` 可先用系统命令） |
 | TUI | ⚠️ 受限 | kitty keyboard protocol、bracketed paste、终端图片依赖连接的终端模拟器（SSH 登录场景可用）；修饰键 native helper（`native-platform.ts`）平台门控仅 darwin/win32 → QNX 下 `isNativeModifierPressed` 恒 false，降级不崩溃 |
-| 剪贴板 | ⚠️ 降级 | `clipboard.ts`：native（pi-tui，无 QNX prebuild）→ 平台命令（xclip/xsel/wl-copy/pbcopy/clip）；QNX 无 X11/Wayland 工具，**SSH 远程会话下 `isRemoteSession()` 触发 OSC 52**，本地控制台直接抛 `Clipboard unavailable`；read 返回 null |
+| 剪贴板 | ⚠️ 降级 | `clipboard.ts`：native（pi-tui，无 QNX prebuild）→ 平台命令（xclip/xsel/wl-copy/pbcopy/clip）→ OSC 52；X11 图片现要求 clipboard owner 宣告图像 target（未宣告的文本不再误判为图片）；QNX 无 X11/Wayland 工具，**SSH 远程会话下 `isRemoteSession()` 触发 OSC 52**，本地控制台直接抛 `Clipboard unavailable`；read 返回 null |
 | headless 模式 | ✅ | `--mode rpc / print / json` 不依赖 TUI |
 | OAuth | ⚠️ 需验证 | 无浏览器环境需走 device code 流程；Copilot/Radius/Kimi 已有实现（`packages/ai/src/auth/oauth/device-code.ts`，github-copilot 轮询带 429 重试），其余 provider 逐个确认 |
 
@@ -131,7 +131,7 @@
 - 初次分析（未搜索 GitHub 前）曾判断"Node 需自行移植、整体不建议"，该结论已被官方 aports 证据推翻，本文档为修正版。
 - Bun 二进制分发版不适用 QNX（Bun 未移植），使用 Node 分发。
 
-## 上游更新记录（0.85.1 → 2026-09-17）
+## 上游更新记录（0.85.1 → 2026-09-25）
 
 截至 2026-09-15 的上一轮记录：`v0.85.1`（2026-09-05 发布）之后有约 97 个未发布提交（版本号仍为 0.85.1），与 QNX 部署相关的要点如下；2026-09-17 增量另列于后文。
 
@@ -160,4 +160,15 @@
 - **TUI 与评测**（#9705、#9706）：`InteractiveMode` 支持注入终端实现；新增上下文 footer 扩展评测；评测从会话消息校验实际系统提示词，并在运行后校验失败时保留已收集的用量与会话诊断。新增的 `autoevals` 是私有 `packages/evals` 包的开发依赖，不是 CLI 的新增运行时依赖。文档对照评测需要 Docker，不是 QNX CLI 部署的前置条件。
 - 另一个提交仅更新贡献者批准名单。
 
-> 注：以上均为未发布内容，版本号与行为可能在下一个 release 前变化。本轮仅核对代码与文档，未在 QNX 设备上执行冒烟验证。
+### 2026-09-25 增量核对（`5a3a03a7f` → `5fd446ca1`，含 v0.87.0/v0.87.1）
+
+本轮合并约 154 个上游提交并发布了 v0.87.0（2026-09-21）、v0.87.1（2026-09-22），与 QNX 部署相关的要点：
+
+- **剪贴板**：X11 图片要求 owner 宣告图像 target；失败上报、未验证本地写入拒绝、OSC 52 headless 回退恢复 → 无变化结论（QNX 无 X11，SSH 路径本质不变）。
+- **TUI**：Kitty 协议图片尺寸按宽高比失真量选择减少拉伸（#9957）；主题色支持 hex/OKLCH 值与 appearance 字段、`tui/src/colors.ts` 颜色助手 → 纯 JS 渲染逻辑，无影响。
+- **HTML 导出**：新增隐藏消息开关（#10020）→ 无影响。
+- **模型目录**：布局/索引校验/版本选择收敛到 `scripts/model-catalog-protocol.ts` 并与 pi.dev 共享；新增 GPT-6 Sol/Luna、Claude Opus 5.5、Grok 4.7、Copilot 模型 → 仅运行时数据，无原生代码。
+- **新包**：`packages/durable`（持久化会话/任务/文档运行时，Pico v5）：memory/JSONL/SQLite 后端，SQLite 用 Node 内置 `node:sqlite`，无原生绑定；`packages/chord` 依赖面不变（esbuild 仍是唯一原生依赖）→ 均可 `--ignore-scripts` 安装，不新增安装步骤。
+- **会话层**：agent-core harness 重构为 Pico5 模型（entry tree + values/lists + Branches/AgentLanes + usage ledger），新增实验性 `pico3/` 内核；coding-agent 自身会话路径不变 → 纯 TS，不影响构建与安装。
+
+> 注：以上含已发布的 v0.87.0/v0.87.1 及至 `5fd446ca1` 的未发布提交，行为可能随后续 release 变化。本轮仅核对代码与文档，未在 QNX 设备上执行冒烟验证。
