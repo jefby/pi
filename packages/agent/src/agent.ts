@@ -1,13 +1,18 @@
-import type {
-	ImageContent,
-	Message,
-	Model,
-	SimpleStreamOptions,
-	TextContent,
-	ThinkingBudgets,
-	Transport,
+import {
+	createInitialSystemMessage,
+	getCurrentSystemMessage,
+	getCurrentSystemPrompt,
+	type ImageContent,
+	type Message,
+	type Model,
+	type SimpleStreamOptions,
+	type TextContent,
+	type ThinkingBudgets,
+	type Transport,
+	toToolDeclaration,
 } from "@earendil-works/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
@@ -22,6 +27,7 @@ import type {
 	BeforeToolCallResult,
 	PrepareNextTurnContext,
 	QueueMode,
+	ShouldStopAfterTurnContext,
 	StreamFn,
 	ToolExecutionMode,
 } from "./types.ts";
@@ -30,7 +36,11 @@ export type { QueueMode } from "./types.ts";
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter(
-		(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+		(message) =>
+			message.role === "system" ||
+			message.role === "user" ||
+			message.role === "assistant" ||
+			message.role === "toolResult",
 	);
 }
 
@@ -63,14 +73,21 @@ type MutableAgentState = Omit<AgentState, "isStreaming" | "streamingMessage" | "
 	errorMessage?: string;
 };
 
-function createMutableAgentState(
-	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>,
-): MutableAgentState {
+/** Initial state for {@link Agent}. `systemPrompt` and `tools` become the leading system message unless `messages` already starts with one. */
+export type AgentInitialState = Partial<
+	Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">
+>;
+
+function createMutableAgentState(initialState?: AgentInitialState): MutableAgentState {
 	let tools = initialState?.tools?.slice() ?? [];
 	let messages = initialState?.messages?.slice() ?? [];
+	const initialMessage = createInitialSystemMessage(initialState?.systemPrompt, tools.map(toToolDeclaration));
+	if (messages[0]?.role !== "system" && initialMessage) messages.unshift(initialMessage);
 
 	return {
-		systemPrompt: initialState?.systemPrompt ?? "",
+		get systemPrompt() {
+			return getCurrentSystemPrompt(messages);
+		},
 		model: initialState?.model ?? DEFAULT_MODEL,
 		thinkingLevel: initialState?.thinkingLevel ?? "off",
 		get tools() {
@@ -94,15 +111,16 @@ function createMutableAgentState(
 
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
-	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>;
+	initialState?: AgentInitialState;
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
-	streamFunction: StreamFn;
+	streamFn: StreamFn;
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 	onPayload?: SimpleStreamOptions["onPayload"];
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext, signal?: AbortSignal) => boolean | Promise<boolean>;
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -187,6 +205,10 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
+	public shouldStopAfterTurn?: (
+		context: ShouldStopAfterTurnContext,
+		signal?: AbortSignal,
+	) => boolean | Promise<boolean>;
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -207,24 +229,27 @@ export class Agent {
 	public toolExecution: ToolExecutionMode;
 
 	constructor(options: AgentOptions) {
-		this._state = createMutableAgentState(options.initialState);
-		this.convertToLlm = options.convertToLlm ?? defaultConvertToLlm;
-		this.transformContext = options.transformContext;
-		this.streamFunction = options.streamFunction;
-		this.getApiKey = options.getApiKey;
-		this.onPayload = options.onPayload;
-		this.onResponse = options.onResponse;
-		this.beforeToolCall = options.beforeToolCall;
-		this.afterToolCall = options.afterToolCall;
-		this.prepareNextTurn = options.prepareNextTurn;
-		this.prepareNextTurnWithContext = options.prepareNextTurnWithContext;
-		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
-		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
-		this.sessionId = options.sessionId;
-		this.thinkingBudgets = options.thinkingBudgets;
-		this.transport = options.transport ?? "auto";
-		this.maxRetryDelayMs = options.maxRetryDelayMs;
-		this.toolExecution = options.toolExecution ?? "parallel";
+		// Older compiled consumers may omit options or streamFn even though the current API requires them.
+		const runtimeOptions: Partial<AgentOptions> = options ?? {};
+		this._state = createMutableAgentState(runtimeOptions.initialState);
+		this.convertToLlm = runtimeOptions.convertToLlm ?? defaultConvertToLlm;
+		this.transformContext = runtimeOptions.transformContext;
+		this.streamFunction = runtimeOptions.streamFn ?? getDefaultStreamFn();
+		this.getApiKey = runtimeOptions.getApiKey;
+		this.onPayload = runtimeOptions.onPayload;
+		this.onResponse = runtimeOptions.onResponse;
+		this.beforeToolCall = runtimeOptions.beforeToolCall;
+		this.afterToolCall = runtimeOptions.afterToolCall;
+		this.shouldStopAfterTurn = runtimeOptions.shouldStopAfterTurn;
+		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
+		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
+		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
+		this.followUpQueue = new PendingMessageQueue(runtimeOptions.followUpMode ?? "one-at-a-time");
+		this.sessionId = runtimeOptions.sessionId;
+		this.thinkingBudgets = runtimeOptions.thinkingBudgets;
+		this.transport = runtimeOptions.transport ?? "auto";
+		this.maxRetryDelayMs = runtimeOptions.maxRetryDelayMs;
+		this.toolExecution = runtimeOptions.toolExecution ?? "parallel";
 	}
 
 	/**
@@ -319,9 +344,14 @@ export class Agent {
 		return this.activeRun?.promise ?? Promise.resolve();
 	}
 
-	/** Clear transcript state, runtime state, and queued messages. */
+	/** Clear conversation state and queues while retaining the replayed prompt/tool baseline. */
 	reset(): void {
-		this._state.messages = [];
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before resetting.");
+		}
+
+		const baseline = getCurrentSystemMessage(this._state.messages);
+		this._state.messages = baseline ? [baseline] : [];
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -350,7 +380,7 @@ export class Agent {
 		}
 
 		const lastMessage = this._state.messages[this._state.messages.length - 1];
-		if (!lastMessage) {
+		if (!lastMessage || this._state.messages.every((message) => message.role === "system")) {
 			throw new Error("No messages to continue from");
 		}
 
@@ -422,7 +452,6 @@ export class Agent {
 
 	private createContextSnapshot(): AgentContext {
 		return {
-			systemPrompt: this._state.systemPrompt,
 			messages: this._state.messages.slice(),
 			tools: this._state.tools.slice(),
 		};
@@ -430,6 +459,7 @@ export class Agent {
 
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
+		const shouldStopAfterTurn = this.shouldStopAfterTurn;
 		return {
 			model: this._state.model,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
@@ -442,6 +472,9 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			shouldStopAfterTurn: shouldStopAfterTurn
+				? async (context) => await shouldStopAfterTurn(context, this.signal)
+				: undefined,
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {

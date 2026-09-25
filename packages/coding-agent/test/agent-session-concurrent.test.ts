@@ -21,7 +21,11 @@ import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
-import type { BuildSystemPromptOptions } from "../src/core/system-prompt.ts";
+import {
+	type BuildSystemPromptOptions,
+	type NormalizedBuildSystemPromptOptions,
+	normalizeBuildSystemPromptOptions,
+} from "../src/core/system-prompt.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -90,7 +94,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				systemPrompt: "Test",
 				tools: [],
 			},
-			streamFunction: (_model, _context, options) => {
+			streamFn: (_model, _context, options) => {
 				abortSignal = options?.signal;
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
@@ -157,7 +161,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 
 		// steer should work while streaming
-		expect(() => session.steer("Steering message")).not.toThrow();
+		await expect(session.steer("Steering message")).resolves.toBeUndefined();
 		expect(session.pendingMessageCount).toBe(1);
 
 		// Cleanup
@@ -173,7 +177,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 
 		// followUp should work while streaming
-		expect(() => session.followUp("Follow-up message")).not.toThrow();
+		await expect(session.followUp("Follow-up message")).resolves.toBeUndefined();
 		expect(session.pendingMessageCount).toBe(1);
 
 		// Cleanup
@@ -195,7 +199,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				systemPrompt: "Test",
 				tools: [],
 			},
-			streamFunction: (_model, context, options) => {
+			streamFn: (_model, context, options) => {
 				abortSignal = options?.signal;
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
@@ -301,7 +305,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				systemPrompt: "Test",
 				tools: [],
 			},
-			streamFunction: () => {
+			streamFn: () => {
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: createAssistantMessage("") });
@@ -362,7 +366,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				systemPrompt: "Test",
 				tools: [tool],
 			},
-			streamFunction: async (_model, context) => {
+			streamFn: async (_model, context) => {
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
 					const toolResultCount = context.messages.filter((message) => message.role === "toolResult").length;
@@ -449,9 +453,8 @@ describe("AgentSession concurrent prompt guard", () => {
 				emitBeforeAgentStart: (
 					prompt: string,
 					images: unknown,
-					systemPrompt: string,
 					systemPromptOptions: BuildSystemPromptOptions,
-				) => Promise<undefined>;
+				) => Promise<{ messages: []; systemPromptOptions: NormalizedBuildSystemPromptOptions }>;
 				invalidate: (message?: string) => void;
 			};
 		};
@@ -469,7 +472,10 @@ describe("AgentSession concurrent prompt guard", () => {
 				return undefined;
 			},
 			emitInput: async () => ({ action: "continue" }),
-			emitBeforeAgentStart: async () => undefined,
+			emitBeforeAgentStart: async (_prompt, _images, systemPromptOptions) => ({
+				messages: [],
+				systemPromptOptions: normalizeBuildSystemPromptOptions(systemPromptOptions),
+			}),
 			invalidate: () => {},
 		};
 
@@ -477,8 +483,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.agent.waitForIdle();
 
 		expect(snapshots).toEqual([
-			["user", "assistant"],
-			["user", "assistant"],
+			["system", "user", "assistant"],
+			["system", "user", "assistant"],
 		]);
 	});
 
@@ -508,7 +514,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				systemPrompt: "Test",
 				tools: [tool],
 			},
-			streamFunction: async (_model, context) => {
+			streamFn: async (_model, context) => {
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
 					const hasToolResult = context.messages.some((message) => message.role === "toolResult");
@@ -594,9 +600,8 @@ describe("AgentSession concurrent prompt guard", () => {
 				emitBeforeAgentStart: (
 					prompt: string,
 					images: unknown,
-					systemPrompt: string,
 					systemPromptOptions: BuildSystemPromptOptions,
-				) => Promise<undefined>;
+				) => Promise<{ messages: []; systemPromptOptions: NormalizedBuildSystemPromptOptions }>;
 				invalidate: (message?: string) => void;
 			};
 		};
@@ -610,7 +615,10 @@ describe("AgentSession concurrent prompt guard", () => {
 				return undefined;
 			},
 			emitInput: async () => ({ action: "continue" }),
-			emitBeforeAgentStart: async () => undefined,
+			emitBeforeAgentStart: async (_prompt, _images, systemPromptOptions) => ({
+				messages: [],
+				systemPromptOptions: normalizeBuildSystemPromptOptions(systemPromptOptions),
+			}),
 			invalidate: () => {},
 		};
 
@@ -620,6 +628,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		const messageEntries = sessionManager.getEntries().filter((entry) => entry.type === "message");
 		expect(messageEntries.map((entry) => entry.message.role)).toEqual([
+			"system",
 			"user",
 			"assistant",
 			"toolResult",
