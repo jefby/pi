@@ -1,6 +1,6 @@
 # Pi → QNX 8.0 移植可行性分析
 
-> 分析日期：2026-08（基于 GitHub 公开仓库证据）；代码增量核对至 2026-09-25，上游 `5fd446ca1`（v0.87.1）。外部 QNX 运行时与工具链结论未在本轮重新验证。
+> 分析日期：2026-08（基于 GitHub 公开仓库证据）；代码增量核对至 2026-09-26，上游 `d6af72e18`。外部 QNX 运行时与工具链结论未在本轮重新验证。
 > 范围：将 pi monorepo（`packages/coding-agent` 主 CLI/SDK）移植到 QNX Neutrino 8.0（x86_64 与 aarch64le 均适用）
 
 ## 结论
@@ -172,3 +172,14 @@
 - **会话层**：agent-core harness 重构为 Pico5 模型（entry tree + values/lists + Branches/AgentLanes + usage ledger），新增实验性 `pico3/` 内核；coding-agent 自身会话路径不变 → 纯 TS，不影响构建与安装。
 
 > 注：以上含已发布的 v0.87.0/v0.87.1 及至 `5fd446ca1` 的未发布提交，行为可能随后续 release 变化。本轮仅核对代码与文档，未在 QNX 设备上执行冒烟验证。
+
+### 2026-09-26 增量核对（`5fd446ca1` → `d6af72e18`）
+
+本轮合并约 15 个上游提交，未触及 QNX 平台分支、工具下载或剪贴板实现：
+
+- **构建工具链**（ca7460d16）：移除 tsgo native preview 与 tsx，改用 TypeScript 7.0.2（`tsc --noEmit`，ES2024，verbatimModuleSyntax）；示例/测试用 plain `node` + source resolver hook 运行。Node 分发仍为 esbuild 单文件 bundle → `--ignore-scripts` 安装要求与 QNX 部署步骤不变。
+- **ai**：openai SDK 升级至 7.19.0 (#10044)；Fast mode service tier 按 priority 计价 (#10034)；Mistral 空 content delta 忽略 (#9674)；模型级 samplingParams 应用于直接 `stream()`/`complete()` 调用 (#9506)——均为纯 TS，无原生代码。
+- **会话层**：新会话文件在首个 user/assistant 消息时落盘（此前仅首个 assistant 后），fork 复用同一规则；durable 新增 conversation document fork + typed IDs/ownership——纯 TS。
+- **TUI/主题**：自定义主题遵循 truecolor (#9973)；overlay 在 stop() 后关闭时保持光标可见——纯 JS 渲染逻辑，SSH 远程路径不受影响。
+
+> 注：以上为至 `d6af72e18` 的未发布提交（v0.87.1 后的下一版本），行为可能随后续 release 变化。本轮仅核对代码与文档，未在 QNX 设备上执行冒烟验证。

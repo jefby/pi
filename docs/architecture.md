@@ -1,7 +1,7 @@
 # Pi 软件流程架构分析
 
 > 分析范围：Pi monorepo 十二个包（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/server`、`packages/client`、`packages/protocol`、`packages/telemetry`、`packages/evals`、`packages/session-backends/sqlite-node`、`packages/chord`、`packages/durable`）以及若干示例扩展工作区，重点描述它们之间的调用与数据流。
-> 最后对齐上游 `5fd446ca1`（v0.87.1），2026-09-25。
+> 最后对齐上游 `d6af72e18`，2026-09-26。
 
 ## 目录
 
@@ -173,6 +173,7 @@ flowchart TB
 
 - **Node 入口**：`packages/coding-agent/src/cli.ts` → `dist/cli.js`（`bin "pi"`）。
 - **Bun 二进制入口**：编译后的 `dist/pi` 同样进入 `cli.ts`。
+- **构建工具链**：改用 TypeScript 7.0.2（`tsc --noEmit`，ES2024，verbatimModuleSyntax），移除 tsgo native preview 与 tsx；Node 分发仍为 esbuild 单文件 bundle；示例/测试用 plain `node` + source resolver hook 运行。
 - **Server 入口**：新 server 为实验性库（无守护进程 CLI）；旧 `server serve/spawn/...` 命令与 instances.json 存储已移除。
 - **Evals 入口**：`npm run eval -w packages/evals` 依次运行宿主机评测与文档对照评测；后者由 `packages/evals/src/cli.ts` 编排，通过 Docker 隔离运行。模型通过 `PI_PROVIDER` / `PI_MODEL` 指定。
 
@@ -185,7 +186,7 @@ flowchart TB
 | `interactive` | 默认 TTY | `modes/interactive/interactive-mode.ts` | 启动 TUI，持续对话 |
 | `print`（内部）/ `text`（CLI） | `--print`、stdin/stdout 非 TTY，或 `--mode text` | `modes/print-mode.ts` | 一次性输出文本 |
 | `json` | `--mode json` | `modes/print-mode.ts`（事件序列化：`modes/json-event.ts`） | 一次性输出 JSONL 事件流；`message_update` 事件携带累计 `usage` |
-| `rpc` | `--mode rpc` | `modes/rpc/` | 通过 stdin/stdout JSONL 接收 `RpcCommand` |
+| `rpc` | `--mode rpc` | `modes/rpc/` | 通过 stdin/stdout JSONL 接收 `RpcCommand`；成功响应携带 `data.disposition`（`handled`/`queued`，prompt 另含 `started`），客户端可据此决定是否等待 `agent_settled` (#9098) |
 
 ### 3.3 模式数据流
 
@@ -257,7 +258,8 @@ main.ts
 `AgentSession` 是 `coding-agent` 的核心抽象，职责包括：
 
 - 管理 `Agent` 实例、扩展运行时、会话持久化。
-- 提供 `prompt()`、`steer()`、`followUp()`、`abort()`、`compact()`、`reload()`、`dispose()`。
+- 提供 `prompt()`、`steer()`、`followUp()`（后两者返回 `QueuedInputDisposition`：`handled`/`queued`）、`abort()`、`compact()`、`reload()`、`dispose()`。
+- 新会话文件在首个 user 或 assistant 消息时创建；仅含 setup 条目（模型、思考级别）的会话保持内存态，fork 经共享 helper 复用同一规则避免重复写 header (#1672/#10000)。
 - 处理 slash 命令（`/new`、`/fork`、`/model`、`/compact` 等）。
 - 在 `agent_start` / `message_end` / `turn_end` 等事件点上持久化会话。
 - 支持 `Skill` 块解析与注入、提示模板展开、HTML 导出。
@@ -359,11 +361,14 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 
 模型目录协议：`scripts/model-catalog-protocol.ts` 将目录布局、索引校验、版本选择与请求协商集中实现；pi.dev 保留同一份代码，发布方与运行当前版本的客户端走相同的选择逻辑（替代跨仓库兼容分发）。
 
-近期提供商兼容与重试行为（截至上游 `5fd446ca1`，v0.87.1）：
+近期提供商兼容与重试行为（截至上游 `d6af72e18`）：
 
 - **Google / Vertex 思考级别**：先由 `clampThinkingLevel()` 选择模型支持的级别，再按 `thinkingLevelMap` 映射；两条 API 共用 `google-shared.ts`。例如支持 `medium` 的模型不再被统一提升为 `HIGH`。关闭思考时，支持关闭的模型使用 `thinkingBudget: 0`，不支持的模型使用最低支持级别。
 - **Anthropic 模型标识**：`AssistantMessage.model` 保留请求模型 ID；服务端返回不同名称时另存 `responseModel`，避免别名或回退模型名称变化导致后续 thinking 重放丢失。匹配 `allowedFallbackModels` 时仍使用实际响应模型的费用配置。
 - **暂时性错误识别**：`utils/retry.ts` 将 Cloudflare HTTP 520 和 Azure 的 `currently experiencing high demand` 错误纳入可重试范围；实际重试仍受调用方策略限制。
+- **OpenAI Fast mode service tier 计价** (#10034)：GPT-6 模型对 Fast mode 请求返回 service_tier "fast"（priority 处理的新名称），此前落入 1x 默认值，现按 priority 计价。openai SDK 升级至 7.19.0 (#10044)。
+- **Mistral 空 content delta** (#9674)：Mistral 上的 GLM 模型在响应开头发送空 content delta（伴随工具调用片段或 thinking 中途），每个都打开一个空文本块，thinking 中途的会把 thinking 拆成两个 block，重放时被 Mistral 以 "Expected at most one leading ThinkChunk" 拒绝；现予忽略。
+- **模型级 samplingParams** (#9506)：此前仅在 `streamSimple()` 合并；直接 `stream()`/`complete()` 调用（如扩展用 `modelRegistry.complete()`）现在也应用——OpenAI 兼容适配器将模型默认值与请求键合并，请求键优先。
 
 ### 4.5 工具执行
 
@@ -401,7 +406,7 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 
 | 工具 | Schema | 流式 | 截断 | 互斥 | 特殊能力 |
 |------|--------|------|------|------|---------|
-| `read` | path/offset/limit | 否 | truncateHead 2000行/50KB | 无 | 图片检测/resize、紧凑渲染分类（docs/skill/resource） |
+| `read` | path/offset/limit | 否 | truncateHead 2000行/50KB | 无 | 图片检测/resize、紧凑渲染分类（docs/skill/resource）；null offset/limit 视为缺失，整文件读取不显示行范围 (#9996) |
 | `bash` | command/timeout | 是（100ms 节流） | truncateTail + temp 文件 | 无 | 进程树管理、命令前缀、PI_* 环境变量注入 |
 | `edit` | path/edits[] | 否 | 无 | fileMutationQueue | fuzzy match（NFKC/引号/空白/破折号）、异步 diff 预览 |
 | `write` | path/content | 是（增量高亮） | 无 | fileMutationQueue | 自动创建父目录、流式语法高亮缓存 |
@@ -480,7 +485,9 @@ flowchart TB
 10. 覆盖层（如模型选择器、会话选择器、主题选择器、思考级别选择器）通过 `showOverlay()` 居中弹出，关闭后焦点返回编辑器。
 11. `terminal-image.ts` 与 `native-modifiers.ts` 提供终端图片预览和原生修饰键检测（Windows/macOS 预编译二进制）。Kitty 协议图片的单元格尺寸现在按宽高比失真量选择，减少拉伸（#9957）。
 12. 主题：首次运行检测终端背景自动选择 `dark`/`light`；`--use-theme <name>`（或 `light/dark` 终端感知对）可为单次运行设置初始主题而不修改保存的设置，后续在 `/settings` 中切换会立即生效并正常保存。
-13. 主题颜色：theme JSON 支持 hex/OKLCH 值与可选 `appearance` 字段（省略时由主题色推断）；`theme.style()` 将 token 或具体颜色与文本属性组合；`packages/tui/src/colors.ts` 提供颜色转换助手（`parseColor`、`mixColors`、`colorToHex`、`styleText`）；`TERM=*-direct` 的终端检测为 truecolor。
+13. 主题颜色：theme JSON 支持 hex/OKLCH 值与可选 `appearance` 字段（省略时由主题色推断）；`theme.style()` 将 token 或具体颜色与文本属性组合；`packages/tui/src/colors.ts` 提供颜色转换助手（`parseColor`、`mixColors`、`colorToHex`、`styleText`）；`TERM=*-direct` 的终端检测为 truecolor。自定义主题加载现在显式解析终端颜色模式（跳过无关的 tmux hyperlink probe、尊重 settings 覆盖）并传给主题构造，使自定义主题遵循 truecolor (#9973)。
+
+14. 光标：overlay 在 stop() 后关闭时不再隐藏 shell 光标（stop 后终端归 shell 所有）。
 
 ### 4.7 上下文压缩
 
@@ -578,7 +585,7 @@ pi 2.0 的核心架构更新，规范已重写为完整的 Pico v5 设计文档�
 实现分工（当前为实验阶段）：
 
 - `packages/agent/src/harness/pico3/`：实验性内核，Chord 集成验证中；暴露新的 harness 原语 `accept` / `drive` / `requestAbort` / `inspectExecution`。
-- `packages/durable`：Pico v5 运行时——memory/JSONL/SQLite 后端、文档迁移、检查点、sidecar 回收。核心规则：单个 Session 提交对条目、任务记录与 Chord 跟踪的文档原子；只有已提交状态可被观察。
+- `packages/durable`：Pico v5 运行时——memory/JSONL/SQLite 后端、会话文档 fork、文档迁移、检查点、sidecar 回收。核心规则：单个 Session 提交对条目、任务记录与 Chord 跟踪的文档原子；只有已提交状态可被观察。Session fork 时按 asOf/current 策略将父会话所有已持久化 conversation document 复制到子会话。
 
 存储层三存储模型：
 
@@ -761,7 +768,7 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 - `session_info`
 - `leaf`
 
-Pico v5（实验，`packages/durable`）：独立存储契约——entries/tasks/documents + checkpoints/迁移，memory/JSONL/SQLite 三种后端；尚未接入 `coding-agent` 默认路径。
+Pico v5（实验，`packages/durable`）：独立存储契约——entries/tasks/documents + conversation document forks + checkpoints/迁移，memory/JSONL/SQLite 三种后端；会话 fork 时复制已持久化对话文档至子会话；尚未接入 `coding-agent` 默认路径。
 
 ---
 
@@ -923,6 +930,7 @@ Pico v5（实验，`packages/durable`）：独立存储契约——entries/tasks
 | 文件 | 职责 |
 |------|------|
 | `packages/durable/src/index.ts` | Pico v5 公共 API（documents、session、types） |
+| `packages/durable/src/session/forks.ts` | conversation document fork（会话 fork 时复制已持久化对话文档至子会话） |
 | `packages/durable/src/storage/memory.ts` | 内存存储后端 |
 | `packages/durable/src/storage/jsonl/` | JSONL 存储（可移植核心 + Node 适配器，fsync 可选） |
 | `packages/durable/src/storage/sqlite/` | SQLite 存储（WAL、有序迁移、conformance） |
