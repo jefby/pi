@@ -1,7 +1,7 @@
 # Pi 软件流程架构分析
 
-> 分析范围：Pi monorepo 十二个包（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/server`、`packages/client`、`packages/protocol`、`packages/telemetry`、`packages/evals`、`packages/session-backends/sqlite-node`、`packages/chord`、`packages/durable`）以及若干示例扩展工作区，重点描述它们之间的调用与数据流。
-> 最后对齐上游 `d6af72e18`，2026-09-26。
+> 分析范围：Pi monorepo 十三个包（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/server`、`packages/client`、`packages/protocol`、`packages/telemetry`、`packages/evals`、`packages/chord`、`packages/durable`、`packages/codemode`、`packages/mcp`）以及若干示例扩展工作区，重点描述它们之间的调用与数据流。
+> 最后对齐上游 `a276dabe5`（v1.0.0），2026-10-03。
 
 ## 目录
 
@@ -22,7 +22,7 @@
   - [4.8 会话存储抽象](#48-会话存储抽象)
   - [4.9 Skills、提示模板与扩展系统](#49-skills-提示模板与扩展系统)
   - [4.10 HTML 会话导出](#410-html-会话导出)
-- [5. Server 多实例架构](#5-server-多实例架构)
+- [5. Server（实验性服务协议）](#5-server-实验性服务协议)
 - [6. Evals 评测框架](#6-evals-评测框架)
 - [7. 数据持久化](#7-数据持久化)
 - [8. 关键文件索引](#8-关键文件索引)
@@ -35,16 +35,17 @@ Pi 是一个模块化、分层设计的 AI 编程助手运行时：
 
 - **`packages/server`**：面向新 durable Session/Agent Harness 接口的实验性本地协调器——可组合服务协议 server + Unix socket 传输、多展示 attachment 路由（`session-router.ts`）、不透明的 Chord service 调用/订阅。旧的多实例守护进程（supervisor/rpc-process）已移除；Radius 现属于 LLM provider 层。
 - **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）、Skills、HTML 导出。依赖 `pi-client`/`pi-protocol` 作为远程会话客户端。
-- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、消息队列（steer/followUp）、工具调度、状态管理。`harness/` 目录提供 Durable AgentHarness v2 实现（tree/facts/lanes/usage ledger 四部分会话模型，见 `packages/agent/docs/harness.md`），但 `coding-agent` 仍有自己独立的会话/工具实现。
+- **`packages/agent`**（`pi-agent-core`）：通用 Agent 运行时——多轮对话循环、消息队列（steer/followUp）、工具调度、状态管理。实验性 Pico5 AgentHarness 已移至 `packages/durable`；`coding-agent` 保持自身独立的会话/工具实现。
 - **`packages/ai`**：统一多提供商 LLM API，封装 OpenAI、Anthropic、Google、Bedrock、Mistral 等协议。
 - **`packages/tui`**：终端 UI 库，提供差分渲染、组件树、键盘输入、编辑器和覆盖层。
 - **`packages/protocol`**：运行时无关的线协议包——schema、类型、CBOR 编解码、字节流 framing，用于 server 与远程会话客户端之间的二进制消息。
 - **`packages/client`**：传输无关的服务协议客户端（`Client`）——在有序字节流上交换服务寻址请求/响应/service event envelope；类型化 API 来自 Chord service bindings。Session target 为 `{ serverId, sessionId, attachmentId }`，客户端不自动重连。
 - **`packages/telemetry`**：遥测包，提供内存/noop 实现，供 harness 与 server 观察与追踪。
 - **`packages/evals`**：内部行为评测包，基于 `vitest-evals` 对 coding-agent 进行端到端评测。
-- **`packages/session-backends/sqlite-node`**：`pi-agent-core` 的可选 SQLite 会话存储后端（自 `packages/storage/sqlite-node` 迁移），基于 `node:sqlite`，实现 Pico v5 Storage 契约（entries / values / usage ledger / sequences & stats）。
 - **`packages/chord`**：应用组合运行时——插件/面（facets）、服务（单例/键控）、复制状态、可插拔远程服务边界。不依赖 Pi 工作区；`coding-agent` 实验性功能与 `pi-durable` 使用其类型与 API，Node 捆绑入口依赖 esbuild。
-- **`packages/durable`**（`@earendil-works/pi-durable`）：持久化会话/任务/文档运行时（Pico v5）——memory/JSONL/SQLite 存储后端、文档迁移、检查点、sidecar 回收。单个 Session 提交对条目、任务记录与 Chord 跟踪的文档原子；规范在 `packages/durable/docs/pico-v5.md`。
+- **`packages/durable`**（`@earendil-works/pi-durable`）：持久化会话/任务/文档运行时（Pico5）——memory/JSONL/SQLite 存储后端、AgentHarness v2（`harness/`）、工具（read/bash/edit/write/image）、会话/文档/任务模型。核心规则：单个 Session 提交对条目、任务记录与 Chord 跟踪的文档原子，仅已提交状态可被观察；规范在 `packages/durable/docs/spec.md`。
+- **`packages/codemode`**（`@earendil-works/pi-codemode`）：QuickJS VM（编译为 WebAssembly）沙箱，运行模型编写的 JavaScript，唯一能力是调用注入的工具；嵌套工具调用不进 LLM 上下文。`pi-coding-agent` 用它实现内置 `codemode` 工具；无 pi 依赖。
+- **`packages/mcp`**（`@earendil-works/pi-mcp`）：独立 MCP 客户端——传输无关的客户端核心、stdio / Streamable HTTP 传输、内存测试传输、`toLlmContent` 转 LLM 内容。
 
 整体数据流向：
 
@@ -62,7 +63,7 @@ flowchart LR
     Client[pi-client 远程客户端]
     Protocol[pi-protocol 线协议]
     Chord[chord 应用组合运行时]
-    Durable[durable 持久化会话/任务/文档运行时 (Pico v5)]
+    Durable[durable 持久化会话/任务/文档运行时 (Pico5)]
     Storage[(SQLite / JSONL)]
 
     User -->|cli / rpc| CodingAgent
@@ -80,7 +81,6 @@ flowchart LR
     CodingAgent -->|read/write| Storage
     Evals -->|harness| CodingAgent
     CodingAgent -->|实验性功能| Chord
-    Agent -.->|pico3 内核（验证中）| Chord
     Durable -->|使用 chord 类型| Chord
 ```
 
@@ -117,10 +117,6 @@ flowchart TB
         Telemetry["@earendil-works/pi-telemetry"]
     end
 
-    subgraph Layer1["可选持久化层"]
-        Storage["@earendil-works/pi-session-backends-sqlite-node"]
-    end
-
     subgraph Layer0["评测/示例扩展层"]
         Evals["@earendil-works/pi-evals"]
         Examples["packages/coding-agent/examples/extensions/*"]
@@ -128,7 +124,7 @@ flowchart TB
 
     subgraph LayerX["新一代运行时（实验）"]
         Chord["@earendil-works/chord 应用组合运行时"]
-        Durable["@earendil-works/pi-durable 持久化会话/任务/文档运行时 (Pico v5)"]
+        Durable["@earendil-works/pi-durable 持久化会话/任务/文档运行时 (Pico5)"]
     end
 
     ServerPkg -->|spawn/rpc| CodingAgent
@@ -140,9 +136,7 @@ flowchart TB
     Client -->|CBOR| Protocol
     CodingAgent -->|pi-client| Client
     CodingAgent -->|实验性功能| Chord
-    AgentCore -.->|SessionStorage| Storage
     AgentCore -.->|telemetry| Telemetry
-    AgentCore -.->|pico3 内核（验证中）| Chord
     Durable -->|使用 chord 类型| Chord
     Evals -->|harness| CodingAgent
     Examples -.->|extends| CodingAgent
@@ -153,16 +147,17 @@ flowchart TB
 | 实验性运行时 | `pi-server` | durable Session/Harness 的本地协调器：服务协议 server、Unix 传输、attachment 路由（实验） |
 | 外部入口 | `pi-coding-agent` CLI | 参数解析、模式分发、主函数入口 |
 | 应用/SDK | `pi-coding-agent` | 会话管理、扩展、工具、模式实现、配置、Skills、导出、模型解析、OAuth/Radius 集成、远程会话客户端 |
-| Agent 运行时 | `pi-agent-core` | 多轮循环、消息队列、工具调度、压缩、持久化抽象、执行环境抽象、Durable AgentHarness v2 |
+| Agent 运行时 | `pi-agent-core` | 通用 Agent 循环：多轮对话、steer/followUp 消息队列、工具调用编排、状态管理（纯 runtime，harness/存储已移出） |
 | LLM 抽象 | `pi-ai` | 多提供商注册、认证、流式请求、协议转换、模型目录、图像生成 |
 | 终端 UI | `pi-tui` | 差分渲染、组件、输入、编辑器、覆盖层、图片/原生修饰键支持 |
 | 线协议 | `pi-protocol` | schema/类型、CBOR 编解码、字节流 framing、消息校验 |
 | 客户端 | `pi-client` | 传输无关的服务协议客户端（Client、Chord service bindings）；session target 为 { serverId, sessionId, attachmentId } |
 | 遥测 | `pi-telemetry` | 内存/noop 遥测实现，观测与追踪 |
-| 可选持久化 | `pi-session-backends-sqlite-node` | SQLite 会话后端（自 `pi-storage-sqlite-node` 迁移）：entries / values / usage ledger / sequences & stats |
 | 评测 | `pi-evals` | 基于 `vitest-evals` 的端到端行为评测 |
 | 新一代运行时 | `pi-chord` | 应用组合运行时：插件/面（facets）、服务、复制状态、远程服务边界；esbuild 仅用于 Node 捆绑入口。用户：coding-agent 实验性功能、pi-durable |
-| 新一代运行时 | `pi-durable` | 持久化会话/任务/文档运行时（Pico v5）：memory/JSONL/SQLite 后端、文档迁移、检查点、sidecar 回收。依赖 chord、pi-ai |
+| 新一代运行时 | `pi-durable` | 持久化会话/任务/文档运行时（Pico5）：AgentHarness v2（`harness/`）、memory/JSONL/SQLite 存储、工具（read/bash/edit/write/image）、文档/任务/会话模型；依赖 chord、pi-ai |
+| 实验运行时 | `pi-codemode` | QuickJS VM（WASM）沙箱，运行模型编写的 JS，仅能调用注入工具；`pi-coding-agent` 的 `codemode` 工具基于它 |
+| 实验运行时 | `pi-mcp` | 独立 MCP 客户端（stdio / Streamable HTTP / in-memory 传输、OAuth），`pi-coding-agent` MCP 扩展基于它 |
 | 示例扩展 | `packages/coding-agent/examples/extensions/*` | 自定义 Provider、沙箱、GitLab Duo 等扩展示例 |
 
 ---
@@ -383,7 +378,7 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 - `packages/coding-agent/src/core/tools/file-mutation-queue.ts` — 写操作互斥锁
 - `packages/agent/src/agent-loop.ts` 中 `executeToolCalls()`
 
-注：`coding-agent` 有自己独立的工具实现（`packages/coding-agent/src/core/tools/`），与 `agent-core` 内部 `packages/agent/src/harness/tools/` 的通用实现无关。
+注：`coding-agent` 有自己独立的工具实现（`packages/coding-agent/src/core/tools/`）；`agent-core` 循环本身不含工具实现，只做 `executeToolCalls()` 编排。Pico5 运行时的工具位于 `packages/durable/src/tools/`。
 
 工具注册：
 
@@ -551,65 +546,62 @@ Session 文件结构变为：
 
 **文件**：
 
-- `packages/agent/src/harness/types.ts`
-- `packages/agent/src/harness/session/session.ts`、`values.ts`、`context.ts`、`commit.ts`、`types.ts`、`index.ts`
-- `packages/agent/src/harness/session/jsonl/`（`repo.ts`、`storage.ts`、`codec.ts`、`io.ts`、`types.ts`）
-- `packages/agent/src/harness/session/jsonl/legacy-v3.ts`（coding-agent v3 格式兼容层）
-- `packages/agent/src/harness/session/memory.ts`
-- `packages/agent/src/harness/session/testing/`（`conformance/`、`gating-storage.ts`、`instrumented-storage.ts`、`storage-decorator.ts`）
-- `packages/agent/src/harness/pico3/` — 实验性 Pico3 内核（Chord 集成验证中：harness、session、scheduler、kinds、view 等）
-- `packages/durable/src/` — Pico v5 运行时（documents、session、storage/memory|jsonl|sqlite）
-- `packages/agent/src/search/index.ts` — 会话/条目搜索接口定义（`SessionSearchService`），实现由调用方注入
-- `packages/agent/src/harness/events.ts`、`result.ts`、`telemetry.ts` — AgentHarness v2 事件/结果/遥测
-- `packages/session-backends/sqlite-node/src/sqlite/`（`repo.ts`、`session.ts`、`migrations.ts`、`storage.ts`、`sql.ts`，以及 `session/` 下 entries / values / usage-ledger / sequences & stats）
+- `packages/coding-agent/src/core/session-manager.ts` — JSONL 会话管理器（`coding-agent` 默认，独立实现，`CURRENT_SESSION_VERSION=3`）
+- `packages/durable/src/index.ts`、`types.ts`、`documents.ts`、`entries.ts`、`ids.ts`、`tasks.ts`、`errors.ts`、`truncate.ts` — 公共 API 与记录模型
+- `packages/durable/src/harness/` — AgentHarness v2：`harness.ts`（`Harness.open`）、`agent.ts`、`define.ts`（`defineDoc`/`defineTool`/`hook`）、`events.ts`（`watchEvents`）、`task-graph.ts`、`compaction.ts`、`usage.ts`、`view.ts`
+- `packages/durable/src/session/` — `session.ts`（`createSession`）、`forks.ts`、`observation.ts`、`transaction.ts`
+- `packages/durable/src/storage/` — `memory.ts`、`jsonl/`（可移植核心 + Node 适配器，fsync 可选）、`sqlite/`（WAL、有序迁移、conformance）
+- `packages/durable/src/tools/` — read/write/bash/edit/edit-diff/image/file-mutation-queue/path-utils
+- `packages/durable/docs/spec.md` — Pico5 规范（normative）
 
-`pi-agent-core` 将会话持久化抽象为 `SessionStorage` 接口：
+`pi-agent-core` 的 `SessionStorage` 抽象随 harness 目录一并移除；`coding-agent` 保留自身 JSONL 的 `SessionManager`。持久化存储后端现全部位于 `packages/durable`（Pico5）：
 
 | 后端 | 实现 | 说明 |
 |------|------|------|
-| JSONL | `JsonlSessionStorage` / `JsonlSessionRepo`（`jsonl/` 目录） | 默认后端，每个会话一个 `.jsonl` 文件，兼容旧格式与 coding-agent v3 格式 |
-| Memory | `MemorySessionStorage` / `MemorySessionRepo`（`memory.ts`） | 内存中，测试/评测使用 |
-| SQLite | `SqliteSessionRepo`（`packages/session-backends/sqlite-node`） | 可选后端（自 `packages/storage/sqlite-node` 迁移），基于 `node:sqlite`；实现 Pico v5 Storage 契约：entries / values / usage ledger / sequences & stats |
+| Memory | `MemoryStorage`（`packages/durable/src/storage/memory.ts`） | 内存中，测试/评测使用 |
+| JSONL | `storage/jsonl/`（可移植核心 + Node 适配器） | JSONL 持久化，fsync 可选 |
+| SQLite | `storage/sqlite/`（WAL、有序迁移、conformance） | `node:sqlite` 基础；Pico5 Storage 契约：entries / documents / usage ledger |
 
-会话搜索：`packages/agent/src/search/index.ts` 定义 `SessionSearchService` 接口（`searchSessions` / `searchEntries` / `sync` / `notify` / `remove`）；扫描式实现已从 agent-core 移除，调用方注入自己的后端实现。
+会话搜索：扫描式实现已从 agent-core 移除（连同 harness），调用方注入自己的后端实现。
 
-#### Durable AgentHarness v2 / Pico v5（`packages/agent/docs/harness.md`）
+#### Pico5 AgentHarness（`packages/durable/docs/spec.md`）
 
-pi 2.0 的核心架构更新，规范已重写为完整的 Pico v5 设计文档。会话由四部分组成：
+pi 2.0 的核心架构更新，规范已重写为规范的 Pico5 设计文档。会话由四部分组成：
 
 1. **Entry tree（条目树）**：不可变消息/压缩/分支摘要/自定义条目，`parentId` 链接，只追加。
-2. **Facts（事实）/ values & lists**：可变、命名空间的键值状态（会话名、标签、应用自定义事实）；Pico v5 表述为 bound typed address 上的 values 与 lists。
+2. **Facts（事实）/ values & lists**：可变、命名空间的键值状态（会话名、标签、应用自定义事实）；Pico5 表述为 bound typed address 上的 values 与 lists。
 3. **Lanes / AgentLanes（泳道）**：树的命名游标。每个会话必有 `main`；一个 lane 拥有自己的 leaf、模型配置、队列和最多一个运行中操作。支持 Slack 线程、子代理等并行工作。
 4. **Usage ledger（用量账本）**：追加式 token/成本事件。
 
-实现分工（当前为实验阶段）：
+实现分工（实验阶段）：
 
-- `packages/agent/src/harness/pico3/`：实验性内核，Chord 集成验证中；暴露新的 harness 原语 `accept` / `drive` / `requestAbort` / `inspectExecution`。
-- `packages/durable`：Pico v5 运行时——memory/JSONL/SQLite 后端、会话文档 fork、文档迁移、检查点、sidecar 回收。核心规则：单个 Session 提交对条目、任务记录与 Chord 跟踪的文档原子；只有已提交状态可被观察。Session fork 时按 asOf/current 策略将父会话所有已持久化 conversation document 复制到子会话。
+- `packages/durable/src/harness/`：AgentHarness v2 内核——`Harness` 入口（`Harness.open`）、`createRegistry`、conversations（submit/wait/commit）、inbox、live 视图、task graph、compaction、usage、hooks（`defineDoc`/`defineTool`/`hook`）、事件订阅（`watchEvents`）。
+- `packages/durable`：Pico5 运行时——memory/JSONL/SQLite 后端、conversation document fork、文档迁移、检查点。核心规则：单个 Session 提交对条目、任务记录与 Chord 跟踪的文档原子；只有已提交状态可被观察。Session fork 时按 asOf/current 策略将父会话已持久化 conversation document 复制到子会话。
+- 旧 `packages/agent/src/harness/pico3/` 实验内核已移除。
 
-存储层三存储模型：
+存储层模型（`packages/durable/src/types.ts`）：
 
-- `entries` — 写一次、只追加的会话树
-- `registers` — 可变命名空间单元格（`op.meta` 写一次、`op.state` 每次转换整体覆盖）
-- `usage ledger` — 追加式成本行
+- `entries` — 写一次、只追加的 transcript 树（`EntryId`，已提交后不可复用）
+- `documents` — Chord 操作的文档（session/conversation/task 作用域；latest 或 rewindable 历史；fork 策略）
+- `tasks` — 持久化任务状态机（`TaskId`，附属于 conversation）
+- `usage ledger` — 追加式成本行（`UsageDoc`）
 
-关键机制：
+关键机制（`packages/durable/docs/spec.md` §1 invariants）：
 
-- **原子事务**：条目插入 + 用量插入 + 寄存器写入，全有或全无，严格递增序列号。
-- **持久化程序计数器**：每步后整体覆盖 `op.state/{operationId}`，恢复时读取该寄存器而非重放日志。
-- **效果三明治（effect sandwich）**：provider 请求和工具调用被两次提交包裹（intent → 执行 → settlement），崩溃可恢复。
-- **确定性步进**：所有效果跨注入边界；`drive: "manual"` 模式下测试逐调用驱动。
+- **原子提交**：单个 Session commit 对条目、任务记录、文档全有或全无，严格递增序列号（gaps permitted）。
+- **仅已提交可见**：文档更新仅在存储提交成功后发布；没有易失发布路径。
+- **草稿撤销**：文档 draft 在事务回调结算时被同步准备/中止，全部撤销。
+- **崩溃恢复**：uncertain storage failure 对打开的 Session 致命，须重新 open；preparation/checkpoint 失败在存储准入前发生并正常回滚。
 
 兼容性策略：旧 coding-agent v3 JSONL 会话必须能打开并恢复 idle；其余格式/API 可破坏。
 
-`SessionStorage` 职责：
+`coding-agent` 的 `SessionManager`（`packages/coding-agent/src/core/session-manager.ts`）职责：
 
-- 追加 `SessionTreeEntry`（消息、模型变更、压缩、分支摘要、自定义条目等）。
-- 维护当前 `leafId` 与会话树分支。
-- 提供 `getPathToRootOrCompaction()` 构建模型上下文。
-- 物化会话统计（token、工具调用数）与标签。
+- 追加 `SessionEntry`（message、model_change、thinking_level_change、compaction、branch_summary、label、custom 等）。
+- 维护会话树（`SessionTreeNode`）与当前 leaf。
+- `buildSessionContext()` 构建 LLM 模型上下文（跳过 label 等不参与上下文的 entry）。
 
-`coding-agent` 当前默认仍使用 JSONL 的 `SessionManager`（在 `packages/coding-agent/src/core/session-manager.ts` 中），该管理器内部实现与 `pi-agent-core` 的抽象并行演进；`pi-session-backends-sqlite-node` 则为需要 SQLite 后端的调用方提供即插即用实现。Pico v5 运行时位于独立的 `packages/durable`，目前仍是实验方向，尚未成为 `coding-agent` 的默认存储路径。
+`coding-agent` 当前默认仍使用 JSONL 的 `SessionManager`（`packages/coding-agent/src/core/session-manager.ts`），独立实现，不受 agent-core 抽象变化影响。Pico5 运行时位于独立的 `packages/durable`（实验方向），尚未成为 `coding-agent` 的默认存储路径；`coding-agent/src/experimental/durable/` 是构建在 `pi-durable` 上的实验性 TUI coding agent。
 
 ### 4.9 Skills、提示模板与扩展系统
 
@@ -619,8 +611,6 @@ pi 2.0 的核心架构更新，规范已重写为完整的 Pico v5 设计文档�
 - `packages/coding-agent/src/core/prompt-templates.ts`
 - `packages/coding-agent/src/core/system-prompt.ts`
 - `packages/coding-agent/src/core/slash-commands.ts`
-- `packages/agent/src/harness/skills.ts`
-- `packages/agent/src/harness/prompt-templates.ts`
 
 Skills：
 
@@ -749,13 +739,13 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 |------|------|------|
 | Agent 配置目录 | `~/.pi/agent/`（可通过 `PI_CODING_AGENT_DIR` 覆盖） | 所有 coding-agent 数据根目录 |
 | 会话历史（JSONL） | `~/.pi/agent/sessions/<encoded-cwd>/<id>.jsonl` | 树状结构的消息、模型变更、思考级别变更、压缩摘要 |
-| 会话历史（SQLite） | `<db-path>`（可配置） | 可选 `SqliteSessionRepo` 持久化（`packages/session-backends/sqlite-node`）：entries / values / usage ledger / sequences & stats 表 |
+| 会话历史（SQLite） | `<db-path>`（可配置） | 可选 SQLite 持久化（`packages/durable/src/storage/sqlite/`）：entries / documents / usage ledger 表 |
 | 设置 | `~/.pi/agent/settings.json` | 用户偏好、模型、Provider 凭证引用 |
 | 凭证 | 系统密钥存储 / `~/.pi/agent/credentials` | API key / OAuth token（由 `CredentialStore` 抽象） |
 | 模型缓存 | `~/.pi/agent/models.json` | 各 Provider 的动态模型列表缓存 |
 | Server socket | 由嵌入应用决定（transports/unix） | 实验性协调器的 Unix socket；路径不再硬编码为 `~/.pi/server` |
 
-会话条目类型（`SessionTreeEntry`）：
+会话条目类型（`SessionEntry`，`coding-agent`）：
 
 - `message`
 - `thinking_level_change`
@@ -768,7 +758,7 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 - `session_info`
 - `leaf`
 
-Pico v5（实验，`packages/durable`）：独立存储契约——entries/tasks/documents + conversation document forks + checkpoints/迁移，memory/JSONL/SQLite 三种后端；会话 fork 时复制已持久化对话文档至子会话；尚未接入 `coding-agent` 默认路径。
+Pico5（实验，`packages/durable`）：独立存储契约——entries/tasks/documents + conversation document forks + checkpoints/迁移，memory/JSONL/SQLite 三种后端；会话 fork 时复制已持久化对话文档至子会话；尚未接入 `coding-agent` 默认路径。
 
 ---
 
@@ -834,6 +824,9 @@ Pico v5（实验，`packages/durable`）：独立存储契约——entries/tasks
 | `packages/coding-agent/src/core/extensions/runner.ts` | 扩展运行时与生命周期钩子 |
 | `packages/coding-agent/src/core/extensions/types.ts` | 扩展 API 类型 |
 | `packages/coding-agent/src/core/extensions/wrapper.ts` | 扩展工具包装 |
+| `packages/coding-agent/src/core/mcp-servers.ts` | MCP server 发现与注册（`--mcp`） |
+| `packages/coding-agent/src/extensions/mcp/` | MCP 扩展：server 发现、`mcp` 命令（`cli.ts`）、配置（`config.ts`） |
+| `packages/coding-agent/src/extensions/codemode/` | codemode 扩展：内置 `codemode` 工具（`tool.ts`）、QuickJS worker（`worker.ts`）、执行/渲染 |
 | `packages/coding-agent/src/core/compaction/compaction.ts` | 上下文压缩核心逻辑 |
 | `packages/coding-agent/src/core/compaction/utils.ts` | 对话序列化、文件操作追踪 |
 | `packages/coding-agent/src/core/compaction/branch-summarization.ts` | 分支摘要 |
@@ -866,75 +859,53 @@ Pico v5（实验，`packages/durable`）：独立存储契约——entries/tasks
 
 | 文件 | 职责 |
 |------|------|
-| `packages/agent/src/agent.ts` | 有状态 Agent 包装器（~600行） |
+| `packages/agent/src/agent.ts` | 有状态 Agent 包装器（steer/followUp 队列、状态，~600行） |
 | `packages/agent/src/agent-loop.ts` | 多轮 LLM/工具循环（~800行） |
-| `packages/agent/src/types.ts` | 核心类型 |
+| `packages/agent/src/types.ts` | 核心类型（QueueMode、AgentEvent、AgentOptions 等） |
 | `packages/agent/src/stream-fn.ts` | 默认流函数 |
 | `packages/agent/src/proxy.ts` | Agent 代理 |
-| `packages/agent/src/search/index.ts` | 会话搜索入口 |
-| `packages/agent/src/node.ts` | Node 环境导出 |
 | `packages/agent/src/index.ts` | 公共导出 |
-| `packages/agent/src/harness/agent-harness.ts` | 生产级 harness（注：`coding-agent` 不使用此文件，由 `AgentSession` 直接替换） |
-| `packages/agent/src/harness/types.ts` | harness 类型：FileSystem、ExecutionEnv、SessionStorage、Result |
-| `packages/agent/src/harness/events.ts` | AgentHarness v2 事件订阅接口 |
-| `packages/agent/src/harness/result.ts` | 运行结果类型 |
-| `packages/agent/src/harness/telemetry.ts` | harness 遥测接入 |
-| `packages/agent/docs/harness.md` | Pico v5 / Durable AgentHarness 实现规范（~1470行） |
-| `packages/agent/docs/values.md` | Pico v5 values/lists 模型文档 |
-| `packages/agent/docs/telemetry-schema.md` | 遥测 schema |
-| `packages/agent/src/harness/session/session.ts` | 树状会话抽象与上下文构建 |
-| `packages/agent/src/harness/session/values.ts` | Pico v5 会话 values/lists（替代旧 facts） |
-| `packages/agent/src/harness/session/commit.ts` | entries + values + usage ledger 的原子提交 |
-| `packages/agent/src/harness/session/context.ts` | 上下文构建 |
-| `packages/agent/src/harness/session/types.ts` | 会话类型定义 |
-| `packages/agent/src/harness/session/jsonl/repo.ts` | JSONL 会话仓库 |
-| `packages/agent/src/harness/session/jsonl/storage.ts` | JSONL SessionStorage 实现 |
-| `packages/agent/src/harness/session/jsonl/codec.ts` | JSONL 编解码 |
-| `packages/agent/src/harness/session/jsonl/io.ts` | JSONL I/O（读写） |
-| `packages/agent/src/harness/session/jsonl/legacy-v3.ts` | coding-agent v3 格式兼容层 |
-| `packages/agent/src/harness/session/memory.ts` | 内存 SessionStorage 实现 |
-| `packages/agent/src/harness/session/testing/conformance/` | 会话后端一致性测试（session-repo / storage） |
-| `packages/agent/src/search/index.ts` | 会话搜索接口定义（`SessionSearchService`），实现由调用方注入 |
-| `packages/agent/src/harness/env/nodejs.ts` | Node.js 文件系统/Shell 执行环境实现 |
-| `packages/agent/src/harness/compaction/compaction.ts` | 上下文压缩（注：`coding-agent` 有独立实现） |
-| `packages/agent/src/harness/compaction/branch-summarization.ts` | 分支摘要 |
-| `packages/agent/src/harness/compaction/utils.ts` | 压缩工具 |
-| `packages/agent/src/harness/prompt-templates.ts` | 提示词模板加载 |
-| `packages/agent/src/harness/skills.ts` | harness 层 Skill 注入 |
-| `packages/agent/src/harness/system-prompt.ts` | 系统提示词构建 |
-| `packages/agent/src/harness/messages.ts` | 消息工具 |
-| `packages/agent/src/harness/tools/index.ts` | harness 工具工厂 |
-| `packages/agent/src/harness/tools/bash.ts` | bash 工具实现 |
-| `packages/agent/src/harness/tools/read.ts` | read 工具实现 |
-| `packages/agent/src/harness/tools/edit.ts` | edit 工具实现 |
-| `packages/agent/src/harness/tools/edit-diff.ts` | diff 计算 |
-| `packages/agent/src/harness/tools/write.ts` | write 工具实现 |
-| `packages/agent/src/harness/tools/image.ts` | 图片工具辅助 |
-| `packages/agent/src/harness/tools/file-mutation-queue.ts` | 文件变更队列 |
-| `packages/agent/src/harness/tools/path-utils.ts` | 路径解析 |
-| `packages/agent/src/harness/tools/tool-context.ts` | 工具上下文 |
-| `packages/agent/src/harness/utils/shell-output.ts` | shell 输出工具 |
-| `packages/agent/src/harness/utils/truncate.ts` | 截断工具 |
-| `packages/agent/src/harness/pico3/` | 实验性 Pico3 内核（Chord 集成验证中）：harness、session、scheduler、kinds、view 等 |
 
 ### Chord (应用组合运行时)
 
 | 文件 | 职责 |
 |------|------|
 | `packages/chord/src/index.ts` | 公共 API（facets/services/replicated state 类型） |
-| `packages/chord/src/context/`、`delta/`、`services/` | Context、不可变 delta 跟踪、服务注册 |
+| `packages/chord/src/context/`、`delta/`、`services/` | Context、不可变/diffable delta（apply-immutable-trusted、revision-validator、diff/draft/tracker）、服务注册（registry、nodejs/nodejs-stdio 绑定、transport） |
 | `packages/chord/src/node/bundle.ts` | esbuild 捆绑入口（`chord/bundler`，实验性插件打包） |
 
-### Durable (Pico v5 运行时)
+### Durable (Pico5 运行时)
 
 | 文件 | 职责 |
 |------|------|
-| `packages/durable/src/index.ts` | Pico v5 公共 API（documents、session、types） |
-| `packages/durable/src/session/forks.ts` | conversation document fork（会话 fork 时复制已持久化对话文档至子会话） |
+| `packages/durable/src/index.ts` | Pico5 公共 API（defineDoc、defineDocFamily、defineEntry、createRegistry、createSession、defineTask、defineTool、hook、watchEvents、Harness、tools 等） |
+| `packages/durable/src/harness/` | AgentHarness v2：`Harness.open`、agent.ts、defineDoc/defineTool/hook、events、task-graph、compaction、usage、view |
+| `packages/durable/src/session/` | `session.ts`（`createSession`）、`forks.ts`（fork 时复制已持久化 conversation document）、observation、transaction |
+| `packages/durable/src/tools/` | read/write/bash/edit/edit-diff/image/file-mutation-queue/path-utils |
 | `packages/durable/src/storage/memory.ts` | 内存存储后端 |
 | `packages/durable/src/storage/jsonl/` | JSONL 存储（可移植核心 + Node 适配器，fsync 可选） |
 | `packages/durable/src/storage/sqlite/` | SQLite 存储（WAL、有序迁移、conformance） |
-| `packages/durable/docs/pico-v5.md` | Pico v5 规范文档 |
+| `packages/durable/docs/spec.md` | Pico5 规范文档 |
+
+### Codemode (QuickJS 沙箱)
+
+| 文件 | 职责 |
+|------|------|
+| `packages/codemode/src/index.ts` | 公共 API（`createCodemode`、`CodemodeCall`/`CodemodeResult`、`CodemodeToolCall`/`CodemodeToolResult`） |
+| `packages/codemode/src/runtime/`、`wasm.ts` | QuickJS runtime（编译为 WebAssembly），WASM 加载与解释执行 |
+| `packages/codemode/src/source.ts` | JS source 解析、执行、工具调用回调 |
+| `packages/codemode/src/declarations.ts`、`identifier.ts`、`types.ts` | 工具声明、标识符解析、类型 |
+
+### MCP (MCP 客户端)
+
+| 文件 | 职责 |
+|------|------|
+| `packages/mcp/src/index.ts` | 公共 API（`createMcpClient`、`McpTool` 等） |
+| `packages/mcp/src/client.ts` | `McpClient`：工具列表、调用、`toLlmContent` 转 LLM 内容 |
+| `packages/mcp/src/transports/stdio.ts`、`transports/streamable-http.ts` | stdio / Streamable HTTP 传输 |
+| `packages/mcp/src/testing/` | in-memory 测试传输（`createMcpServerTransport`） |
+| `packages/mcp/src/auth-provider.ts`、`oauth/` | OAuth 认证 |
+| `packages/mcp/src/protocol/` | request/response 类型 |
 
 ### AI
 
@@ -1017,21 +988,6 @@ Pico v5（实验，`packages/durable`）：独立存储契约——entries/tasks
 | `packages/telemetry/src/memory.ts` | 内存遥测实现 |
 | `packages/telemetry/src/noop.ts` | noop 遥测实现 |
 
-### Session Backends (SQLite Node)
-
-| 文件 | 职责 |
-|------|------|
-| `packages/session-backends/sqlite-node/src/index.ts` | Node sqlite 适配器与后端导出 |
-| `packages/session-backends/sqlite-node/src/sqlite/repo.ts` | `SqliteSessionRepo`：create/open/list/delete/fork |
-| `packages/session-backends/sqlite-node/src/sqlite/storage.ts` | SQLite Storage 实现（Pico v5 契约） |
-| `packages/session-backends/sqlite-node/src/sqlite/session/entries.ts` | 会话条目编码/解码 |
-| `packages/session-backends/sqlite-node/src/sqlite/session/values.ts` | values/lists 存储（替代旧 facts） |
-| `packages/session-backends/sqlite-node/src/sqlite/session/usage-ledger.ts` | 用量账本（追加式 token/成本事件） |
-| `packages/session-backends/sqlite-node/src/sqlite/session/session-sequences.ts` | 序列号存储 |
-| `packages/session-backends/sqlite-node/src/sqlite/session/session-stats.ts` | 会话统计 |
-| `packages/session-backends/sqlite-node/src/sqlite/migrations.ts`、`migrations/001_initial.sql` | 有序 schema 迁移 |
-| `packages/session-backends/sqlite-node/src/sqlite/sql.ts` | SQL 工具 |
-
 ### Evals
 
 | 文件 | 职责 |
@@ -1053,15 +1009,15 @@ Pi 的架构呈现清晰的纵向分层：
 
 1. **入口层**（CLI / Server / Bun 二进制）负责启动和外部连接。
 2. **应用层**（`coding-agent`）承载产品级语义：会话、扩展、工具、配置、UI、Skills、导出、模型解析、信任与认证。
-3. **运行时层**（`agent-core`）提供与产品无关的 Agent 循环、状态、压缩、可插拔存储与执行环境抽象，并内置 read/bash/edit/write 等通用工具实现。
+3. **运行时层**（`agent-core`）提供与产品无关的多轮 Agent 循环、steer/followUp 消息队列、工具调用编排与状态（纯 runtime；harness/存储/工具已移至 `pi-durable`）。
 4. **LLM 层**（`ai`）将多提供商差异收敛为统一的消息/事件/认证模型，支持图像生成与多种 OAuth 流程。
 5. **UI 层**（`tui`）提供高效差分渲染的终端组件系统，支持图片、原生修饰键、自动补全等编辑器增强。
 6. **线协议/客户端层**（`protocol`/`client`）为远程会话提供二进制消息协议与传输无关的客户端；**遥测层**（`telemetry`）提供可插拔观测。
-7. **持久化层**（`session-backends/sqlite-node`，自 `storage/sqlite-node` 迁移）提供可选的 SQLite 后端实现（Pico v5 Storage 契约：entries / values / usage ledger / sequences & stats）。
+7. **持久化层**：`coding-agent` 默认使用自身 JSONL `SessionManager`；Pico5 存储后端（memory/JSONL/SQLite，Pico5 Storage 契约：entries / documents / usage ledger）位于 `packages/durable/src/storage/`。
 8. **评测层**（`evals`）对 coding-agent 进行端到端行为评测。
 9. **示例扩展层**（`packages/coding-agent/examples/extensions/*`）展示如何扩展 Provider、UI 与沙箱。
-10. **新一代运行时层**（`chord`/`durable`）提供应用组合（facets/services/replicated state）与持久化会话/任务/文档运行时（Pico v5），当前为实验方向。
+10. **新一代运行时层**（`chord`/`durable`）提供应用组合（facets/services/replicated state）与持久化会话/任务/文档运行时（Pico5：AgentHarness v2 + memory/JSONL/SQLite），当前为实验方向。
 
-**Pi 2.0（Pico v5 / AgentHarness v2）方向**：`packages/agent/docs/harness.md` 定义了持久化 Agent 运行时（entry tree + facts/values & lists + lanes + usage ledger 四部分会话模型、三存储原子事务、效果三明治、崩溃恢复）；实现由 `agent-core` 的实验性 `pico3/` 内核与独立的 `packages/durable`（memory/JSONL/SQLite 后端、文档迁移、检查点）承担，依赖 `packages/chord` 的应用组合运行时。配套 `protocol`/`client` 包支持远程会话接入，SQLite 后端迁移至 `session-backends`。这是与当前 `coding-agent` 并行的新一代架构。
+**Pi 2.0（Pico5 / AgentHarness v2）方向**：`packages/durable/docs/spec.md` 定义了持久化 Agent 运行时（entry tree + values/lists + lanes + usage ledger 四部分会话模型、原子提交、仅已提交可见、崩溃恢复）；实现由 `packages/durable/src/harness/`（AgentHarness v2）及其 memory/JSONL/SQLite 存储承担，依赖 `packages/chord` 的应用组合运行时。配套 `protocol`/`client` 包支持远程会话接入。新增 `packages/codemode`（QuickJS 沙箱）与 `packages/mcp`（MCP 客户端）扩展运行时能力。这是与当前 `coding-agent` 并行的新一代架构。
 
 核心控制流是：用户输入 → `AgentSession.prompt()` → `Agent` 循环 → `Models.stream()` → 上游 LLM → 流式事件 → 工具执行 → 事件持久化 → UI/stdout 渲染。扩展和钩子机制贯穿整个流程，允许在输入、LLM 请求、工具调用、输出渲染等节点注入自定义行为。
