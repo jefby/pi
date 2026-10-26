@@ -1,6 +1,6 @@
 # Pi → QNX 8.0 移植可行性分析
 
-> 分析日期：2026-08（基于 GitHub 公开仓库证据）；代码增量核对至 2026-09-17，上游 `5a3a03a7f`。外部 QNX 运行时与工具链结论未在本轮重新验证。
+> 分析日期：2026-08（基于 GitHub 公开仓库证据）；代码增量核对至 2026-10-11，上游 `e6b9a6af5`（v1.1.0 后）。外部 QNX 运行时与工具链结论未在本轮重新验证。
 > 范围：将 pi monorepo（`packages/coding-agent` 主 CLI/SDK）移植到 QNX Neutrino 8.0（x86_64 与 aarch64le 均适用）
 
 ## 结论
@@ -22,7 +22,7 @@
 - 仓库：[qnx-ports/aports](https://github.com/qnx-ports/aports)，PR [#354 extra/nodejs: new](https://github.com/qnx-ports/aports/pull/354)，2026-04-20 合并，维护者 Aaron Bassett (QNX)
 - 安装：`sudo apk add nodejs npm`
 - `APKBUILD` 关键构建参数：
-  - `--shared-sqlite` → **`node:sqlite`（`DatabaseSync`）可用**，pi 的 `session-backends/sqlite-node` 后端可用
+  - `--shared-sqlite` → **`node:sqlite`（`DatabaseSync`）可用**，pi 的 SQLite 存储后端可用（实验性 `pi-durable` 的 `packages/durable/src/storage/sqlite/node.ts`；主线 coding-agent 使用自带 JSONL 会话管理，不依赖 SQLite）
   - `--shared-libuv --shared-openssl --shared-icu --shared-zlib` 等系统库
   - 版本策略：仅更新 LTS（`pkgver=24.14.1`）
 - 配套源码 fork：[qnx-ports/node](https://github.com/qnx-ports/node)，tag `qnx-v24.14.1`，含 QNX 专用补丁：
@@ -57,12 +57,12 @@
 |----|------|------|
 | 运行时 | ✅ | Node 24.14.1 LTS ≥ pi 要求 `>=22.19.0`；`node:sqlite`、`worker_threads`、`AbortSignal.any/timeout`、UDS (`AF_UNIX`)、信号/进程组均可用 |
 | `process.platform` | ✅ 有利 | 返回 `"qnx"` → pi 的 win32/linux 分支都不误命中；`package-manager.ts` 的 `/proc/self/environ` 读取、footer-data-provider 的 WSL 检测等 `platform === "linux"` 门控逻辑被跳过 |
-| npm 安装 | ⚠️ 需 `--ignore-scripts` | Node 分发为 esbuild 单文件 bundle（bin → `dist/bundle/cli.js`，纯 ESM）；多数依赖纯 JS + WASM（`@silvia-odwyer/photon-node` 是 WASM；剪贴板/修饰键原生能力由 `@earendil-works/pi-tui` 随包预编译 `.node` 提供，仅 darwin/win32/linux-X11，安装不编译）。但新版 `@earendil-works/chord` 依赖 `esbuild`（带 postinstall，无 qnx 平台包）→ QNX 上直接 `npm install` 会因 esbuild postinstall 抛 `Unsupported platform: qnx ...` 失败，需 `npm install --ignore-scripts`（见下文 esbuild 缺口） |
+| npm 安装 | ⚠️ 需 `--ignore-scripts` | Node 分发为 esbuild 单文件 bundle（bin → `dist/bundle/cli.js`，纯 ESM）；多数依赖纯 JS + WASM（`@silvia-odwyer/photon-node`、`quickjs-wasi` 是 WASM，`typebox` 纯 JS，lockfile 均无 install script；剪贴板/修饰键原生能力由 `@earendil-works/pi-tui` 随包预编译 `.node` 提供，仅 darwin/win32/linux-X11，安装不编译）。上游已移除 npm shrinkwrap 并推荐 managed installer，npm 分发本身不变。新版 `@earendil-works/chord` 依赖 `esbuild`（带 postinstall，无 qnx 平台包）→ QNX 上直接 `npm install` 会因 esbuild postinstall 抛 `Unsupported platform: qnx ...` 失败，需 `npm install --ignore-scripts`（见下文 esbuild 缺口） |
 | bash 工具 | ✅ | aports 有 bash 5.3；`shell.ts` 路径 `/bin/bash` → PATH bash → `sh` 兜底成立 |
 | git | ✅ | aports 有 git；footer 分支显示可用 |
 | grep 工具 | ❌ 硬缺口 | 需要 `rg`；pi 的自动下载（`tools-manager.ts`）只支持 darwin/linux/win32 资产 |
 | find 工具 | ⚠️ 缺口 | 需要 `fd`（有 `systemBinaryNames` 可先用系统命令） |
-| TUI | ⚠️ 受限 | kitty keyboard protocol、bracketed paste、终端图片依赖连接的终端模拟器（SSH 登录场景可用）；修饰键 native helper（`native-platform.ts`）平台门控仅 darwin/win32 → QNX 下 `isNativeModifierPressed` 恒 false，降级不崩溃 |
+| TUI | ⚠️ 受限 | 全屏布局自 v1.0 起为默认（`tuiMode: "fullscreen"`：备用屏布局、滚轮加速、OSC 7501 状态上报），需终端支持备用屏与光标定位，可经设置切回内联模式；kitty keyboard protocol、bracketed paste、终端图片依赖连接的终端模拟器（SSH 登录场景可用）；修饰键 native helper（`native-platform.ts`）平台门控仅 darwin/win32 → QNX 下 `isNativeModifierPressed` 恒 false，降级不崩溃 |
 | 剪贴板 | ⚠️ 降级 | `clipboard.ts`：native（pi-tui，无 QNX prebuild）→ 平台命令（xclip/xsel/wl-copy/pbcopy/clip）；QNX 无 X11/Wayland 工具，**SSH 远程会话下 `isRemoteSession()` 触发 OSC 52**，本地控制台直接抛 `Clipboard unavailable`；read 返回 null |
 | headless 模式 | ✅ | `--mode rpc / print / json` 不依赖 TUI |
 | OAuth | ⚠️ 需验证 | 无浏览器环境需走 device code 流程；Copilot/Radius/Kimi 已有实现（`packages/ai/src/auth/oauth/device-code.ts`，github-copilot 轮询带 429 重试），其余 provider 逐个确认 |
@@ -105,6 +105,7 @@
 - coding-agent 自 0.85.1 起依赖 `@earendil-works/chord`，chord 又依赖 `esbuild`（用在 `packages/chord/src/node/bundle.ts`，即 `chord/bundler`、`chord/node` 入口）
 - esbuild 0.28.2 带 postinstall（`hasInstallScript: true`），其 `install.js` 按 `process.platform + arch + endianness` 查平台包表；`qnx arm64 LE` / `qnx x64 LE` 不在 `knownUnixlikePackages` 中 → 直接抛 `Unsupported platform: qnx arm64 LE`，导致整个 `npm install` 失败
 - 稳定 `pi` CLI 不加载 chord/esbuild：Node bundle 中 `@earendil-works/chord` 为 external，且只有 `src/experimental/**`（`PI_EXPERIMENTAL=1` 的插件打包 `bundleFacetPackage`、服务模式）会静态 import esbuild
+- 2026-10-11 复核：coding-agent 新增 `pi-codemode`/`pi-mcp` 运行时依赖（`quickjs-wasi`、`cross-spawn`、`typebox` 等，lockfile 均无 install script），esbuild 仍仅经 chord 传递，`src/node/bundle.ts` 路径未变，上述结论不变
 - 解决：
   1. **安装加 `--ignore-scripts`**（推荐）：跳过 esbuild 的 postinstall，稳定 CLI 不受影响
   2. 若需 experimental 插件打包：esbuild 是 Go 程序，可交叉编译到 QNX，再用 `ESBUILD_BINARY_PATH` 指向该二进制（esbuild 的 install.js 与运行时的 JS API 均支持该环境变量覆盖）
@@ -131,9 +132,9 @@
 - 初次分析（未搜索 GitHub 前）曾判断"Node 需自行移植、整体不建议"，该结论已被官方 aports 证据推翻，本文档为修正版。
 - Bun 二进制分发版不适用 QNX（Bun 未移植），使用 Node 分发。
 
-## 上游更新记录（0.85.1 → 2026-09-17）
+## 上游更新记录（0.85.1 → 2026-10-11）
 
-截至 2026-09-15 的上一轮记录：`v0.85.1`（2026-09-05 发布）之后有约 97 个未发布提交（版本号仍为 0.85.1），与 QNX 部署相关的要点如下；2026-09-17 增量另列于后文。
+截至 2026-09-15 的上一轮记录：`v0.85.1`（2026-09-05 发布）之后有约 97 个未发布提交（版本号仍为 0.85.1），与 QNX 部署相关的要点如下；2026-09-17 与 2026-10-11 增量另列于后文。
 
 ### 性能
 
@@ -161,3 +162,26 @@
 - 另一个提交仅更新贡献者批准名单。
 
 > 注：以上均为未发布内容，版本号与行为可能在下一个 release 前变化。本轮仅核对代码与文档，未在 QNX 设备上执行冒烟验证。
+
+### 2026-10-11 增量核对（`5a3a03a7f` → `e6b9a6af5`，v0.86.0 → v1.1.0）
+
+本轮合并约 300 个上游提交，覆盖 v0.86.x、v0.87.x、v0.99.x、v1.0.x、v1.1.0 多个发布。逐项核对平台分支、工具下载与剪贴板实现后，**QNX 移植结论不变**；与本部署相关的要点如下。
+
+**包结构变化（不影响 QNX 安装路径）**
+
+- `pi-agent-core` 移除实验性 harness（会话树、`SessionStorage`、JSONL/SQLite 后端、跨会话搜索）；`packages/session-backends/sqlite-node` 包删除，SQLite 存储进入实验性 `pi-durable`（`packages/durable/src/storage/sqlite/`，`node:sqlite`）。
+- coding-agent 新增运行时依赖 `pi-codemode`（quickjs-wasi 沙箱脚本工具）与 `pi-mcp`（MCP 客户端）；`pi-durable`、`pi-env`（SSH 远程执行）为独立/实验包，不进入稳定 CLI 依赖树。
+- 新依赖均为纯 JS/WASM（lockfile 无 install script），esbuild 仍仅经 `chord` 传递——`--ignore-scripts` 结论不变（见上文 esbuild 缺口）。
+- npm shrinkwrap 移除，上游推荐 managed installer；npm 分发仍为 Node esbuild 单文件 bundle，安装方式不变。
+
+**平台相关行为**
+
+- 全屏布局成为默认 TUI 模式（`tuiMode: "fullscreen"`，备用屏 + OSC 7501 状态上报）：SSH 终端需支持备用屏；可经设置切回内联模式。
+- 内置工具新增 `powershell`（复用 bash 操作抽象，Windows 场景）；`DEFAULT_TOOL_NAMES` 仍为 `[read, bash, edit, write]`；`tools-manager.ts` 平台门控不变——`process.platform === "qnx"` 时 `getAssetName()` 返回 null，自动下载仍被跳过，rg/fd 放 PATH 即可。
+- 剪贴板新增 Android/Termux 读取与 X11 广播图片能力校验；QNX 路径（OSC 52 fallback / 本地控制台不可用）结论不变。
+- 9 月 17 日的 6 个提交（事件处理器取消订阅、强制系统提示词不落盘、信号终止的 shell 命令报失败、Vercel AI Gateway thinking 保留、Anthropic thinking 丢弃提示缩短）均无平台依赖。
+- llama 内置扩展仍在（aports llama.cpp 可用的结论维持）；Node 引擎要求仍为 `>=22.19.0`（QNX apk 的 Node 24.14.1 满足）。
+
+**OAuth（无浏览器场景）**
+
+- 新增 Anthropic copy-code 登录（#10194）、workload identity federation（#10242）、MCP 服务器 OAuth（动态客户端注册、RFC 9207 `iss` 校验、step-up 授权、按服务器存储凭证）；无浏览器时仍以 device code 流程为主，逐 provider 验证的注意事项不变。

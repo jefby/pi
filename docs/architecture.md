@@ -1,6 +1,6 @@
 # Pi 软件流程架构分析
 
-> 分析范围：Pi monorepo 十个核心工作区（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/server`、`packages/client`、`packages/protocol`、`packages/telemetry`、`packages/evals`、`packages/session-backends/sqlite-node`）以及若干示例扩展工作区，重点描述它们之间的调用与数据流。
+> 分析范围：Pi monorepo 核心工作区（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/durable`、`packages/codemode`、`packages/mcp`、`packages/server`、`packages/client`、`packages/protocol`、`packages/telemetry`、`packages/env`、`packages/chord`、`packages/evals`）以及若干示例扩展工作区，重点描述它们之间的调用与数据流。核对至上游 `e6b9a6af5`（v1.1.0 之后，2026-10-11）。
 
 ## 目录
 
@@ -21,7 +21,7 @@
   - [4.8 会话存储抽象](#48-会话存储抽象)
   - [4.9 Skills、提示模板与扩展系统](#49-skills-提示模板与扩展系统)
   - [4.10 HTML 会话导出](#410-html-会话导出)
-- [5. Server 多实例架构](#5-server-多实例架构)
+- [5. Server：durable Session 路由（实验性）](#5-serverdurable-session-路由实验性)
 - [6. Evals 评测框架](#6-evals-评测框架)
 - [7. 数据持久化](#7-数据持久化)
 - [8. 关键文件索引](#8-关键文件索引)
@@ -32,38 +32,42 @@
 
 Pi 是一个模块化、分层设计的 AI 编程助手运行时：
 
-- **`packages/server`**：可选的本地守护进程，管理多个 `pi-coding-agent` 子进程，通过 Unix Domain Socket 暴露 JSONL IPC；可选注册到 Radius 中继。依赖 `pi-protocol` 实现远程会话线协议。
-- **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）、Skills、HTML 导出。依赖 `pi-client`/`pi-protocol` 作为远程会话客户端。
-- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、消息队列（steer/followUp）、工具调度、状态管理。`harness/` 目录提供 Durable AgentHarness v2 实现（tree/facts/lanes/usage ledger 四部分会话模型，见 `packages/agent/docs/harness.md`），但 `coding-agent` 仍有自己独立的会话/工具实现。
+- **`packages/server`**：实验性的本地路由服务器，把外部客户端路由到应用托管的 durable Session：应用实现 `SessionDirectory`（会话目录投影）与 `SessionManagement`（创建/删除/挂载），服务器按 `{serverId, sessionId, attachmentId}` 校验附件路由，`invokeService()` 不解码业务负载，支持一个会话多个呈现附件。通过 `pi-server/unix` 提供 Unix Domain Socket 传输。纯库、无 CLI，`coding-agent` 仅在实验代码（devDependencies）中使用。
+- **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）、Skills、HTML 导出。内置工具之外通过 `pi-codemode`（quickjs 沙箱脚本工具）与 `pi-mcp`（MCP 服务器客户端）扩展；`src/experimental/` 提供 durable TUI、实验客户端/服务器与 Radius 中继（`PI_EXPERIMENTAL=1` 启用）。
+- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、消息队列（steer/followUp）、工具调度、状态管理。原实验性 harness（会话树/存储抽象/搜索）已迁出至 `pi-durable`，本包现仅保留核心循环。
+- **`packages/durable`**：实验性持久 Agent 运行时——会话、模型轮次、工具调用与应用状态先提交存储再展示，进程中途崩溃后重开存储可从断点继续。包含事务会话（fork/checkpoint/migration）、任务运行时（结构化并发、ownership、inbox/submissions、task graph）、压缩与溢出、watch、图像（Photon worker 线程）；存储后端 JSONL / SQLite（`node:sqlite` 与 Cloudflare Durable Object 适配器）/ memory。文档状态基于 `chord`。规范见 `packages/durable/docs/spec.md`。
+- **`packages/codemode`**：沙箱化 JavaScript 执行——脚本唯一的能力是调用注入的工具（quickjs-wasi 运行时）；支持经 Cloudflare Workers 远程 Durable Object 运行沙箱。
+- **`packages/mcp`**：独立 Model Context Protocol 客户端（stdio / Streamable HTTP 传输、OAuth 授权与动态客户端注册），供 pi 与其他应用复用。
+- **`packages/env`**：pi-durable 的远程执行环境——一个通过 SSH 部署的小型守护进程及其 ExecutionEnv 客户端。
 - **`packages/ai`**：统一多提供商 LLM API，封装 OpenAI、Anthropic、Google、Bedrock、Mistral 等协议。
-- **`packages/tui`**：终端 UI 库，提供差分渲染、组件树、键盘输入、编辑器和覆盖层。
-- **`packages/protocol`**：运行时无关的线协议包——schema、类型、CBOR 编解码、字节流 framing，用于 server 与远程会话客户端之间的二进制消息。
-- **`packages/client`**：传输无关的远程会话客户端（`PiClient`），通过 `ByteTransport` 交换长度前缀 CBOR 消息，支持会话创建/获取/订阅/提示。
-- **`packages/telemetry`**：遥测包，提供内存/noop 实现，供 harness 与 server 观察与追踪。
+- **`packages/tui`**：终端 UI 库，提供差分渲染、组件树、键盘输入、编辑器和覆盖层，默认全屏布局。
+- **`packages/chord`**：应用组合运行时——服务、复制状态、RPC、facets、插件；pi-durable 的文档状态与 delta 引擎基于它，`chord/node` 提供插件打包（依赖 esbuild）。
+- **`packages/protocol`**：运行时无关的线协议包——schema、类型、CBOR 编解码、字节流 framing，用于客户端与服务器之间的二进制消息。
+- **`packages/client`**：传输无关的远程会话客户端（`PiClient`），通过 `ByteTransport` 交换长度前缀 CBOR 消息（依赖 `chord` 的复制状态）。
+- **`packages/telemetry`**：遥测包，提供内存/noop 实现，供运行时观察与追踪。
 - **`packages/evals`**：内部行为评测包，基于 `vitest-evals` 对 coding-agent 进行端到端评测。
-- **`packages/session-backends/sqlite-node`**：`pi-agent-core` 的可选 SQLite 会话存储后端（自 `packages/storage/sqlite-node` 迁移），基于 `node:sqlite`，实现 tree/lanes/facts/records 四类存储。
 
 整体数据流向：
 
 ```mermaid
 flowchart LR
     User[用户/外部客户端]
-    Server[server.sock<br/>二进制线协议]
     CodingAgent[pi-coding-agent]
     Agent[Agent 运行时]
     AI[pi-ai 提供商层]
     LLM[上游 LLM API]
     TUI[pi-tui 终端 UI]
     Tools[文件/Shell 工具]
+    Codemode[pi-codemode<br/>quickjs 沙箱]
+    MCP[pi-mcp<br/>MCP 服务器]
+    Durable[pi-durable<br/>实验性持久运行时]
+    Chord[pi-chord<br/>组合运行时]
     Evals[pi-evals]
     Client[pi-client 远程客户端]
     Protocol[pi-protocol 线协议]
-    Storage[(SQLite / JSONL)]
+    Server[pi-server<br/>durable Session 路由]
 
     User -->|cli / rpc| CodingAgent
-    Client -->|CBOR 消息| Protocol
-    Protocol -->|字节流| Server
-    Server -->|spawn/rpc| CodingAgent
     CodingAgent -->|"new Agent()"| Agent
     Agent -->|stream| AI
     AI -->|HTTP/SSE| LLM
@@ -72,7 +76,13 @@ flowchart LR
     Agent -->|events| CodingAgent
     CodingAgent -->|render| TUI
     CodingAgent -->|execute| Tools
-    CodingAgent -->|read/write| Storage
+    CodingAgent -->|注入工具| Codemode & MCP
+    CodingAgent -.->|PI_EXPERIMENTAL=1| Durable
+    Durable -->|文档状态| Chord
+    Client -->|CBOR 消息| Protocol
+    Protocol -->|durable Session 路由| Server
+    Server -->|host harness| Durable
+    CodingAgent -.->|devDep| Client
     Evals -->|harness| CodingAgent
 ```
 
@@ -83,20 +93,30 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph Layer7["外部入口层"]
-        ServerPkg["@earendil-works/pi-server"]
-        CodingAgentCli["pi CLI (packages/coding-agent/dist/cli.js)"]
+        CodingAgentCli["pi CLI (packages/coding-agent/dist/bundle/cli.js)"]
     end
 
     subgraph Layer6["应用/SDK 层"]
         CodingAgent["@earendil-works/pi-coding-agent"]
     end
 
+    subgraph Layer5b["能力扩展层"]
+        Codemode["@earendil-works/pi-codemode"]
+        MCP["@earendil-works/pi-mcp"]
+    end
+
     subgraph Layer5["Agent 运行时层"]
         AgentCore["@earendil-works/pi-agent-core"]
+        Durable["@earendil-works/pi-durable（实验性）"]
+        Env["@earendil-works/pi-env"]
     end
 
     subgraph Layer4["LLM 抽象层"]
         AI["@earendil-works/pi-ai"]
+    end
+
+    subgraph Layer3b["组合运行时层"]
+        Chord["@earendil-works/chord"]
     end
 
     subgraph Layer3["终端 UI 层"]
@@ -106,11 +126,8 @@ flowchart TB
     subgraph Layer2["线协议/客户端层"]
         Protocol["@earendil-works/pi-protocol"]
         Client["@earendil-works/pi-client"]
+        Server["@earendil-works/pi-server"]
         Telemetry["@earendil-works/pi-telemetry"]
-    end
-
-    subgraph Layer1["可选持久化层"]
-        Storage["@earendil-works/pi-session-backends-sqlite-node"]
     end
 
     subgraph Layer0["评测/示例扩展层"]
@@ -118,15 +135,21 @@ flowchart TB
         Examples["packages/coding-agent/examples/extensions/*"]
     end
 
-    ServerPkg -->|spawn/rpc| CodingAgent
     CodingAgentCli --> CodingAgent
     CodingAgent --> AgentCore
     CodingAgent --> TUI
+    CodingAgent --> Codemode
+    CodingAgent --> MCP
+    CodingAgent -.->|experimental| Durable
     AgentCore --> AI
-    ServerPkg -->|CBOR| Protocol
-    Client -->|CBOR| Protocol
-    CodingAgent -->|pi-client| Client
-    AgentCore -.->|SessionStorage| Storage
+    Durable --> AI
+    Durable --> Chord
+    Env --> Durable
+    Client --> Protocol
+    Client -.-> Chord
+    Server --> Protocol
+    Server --> Chord
+    CodingAgent -.->|devDep| Client & Server
     AgentCore -.->|telemetry| Telemetry
     Evals -->|harness| CodingAgent
     Examples -.->|extends| CodingAgent
@@ -134,16 +157,20 @@ flowchart TB
 
 | 层级 | 包 | 主要职责 |
 |------|------|----------|
-| 外部入口 | `pi-server` | 多实例守护、进程监管、RPC 桥接、Radius 中继 |
-| 外部入口 | `pi-coding-agent` CLI | 参数解析、模式分发、主函数入口 |
-| 应用/SDK | `pi-coding-agent` | 会话管理、扩展、工具、模式实现、配置、Skills、导出、模型解析、OAuth/Radius 集成、远程会话客户端 |
-| Agent 运行时 | `pi-agent-core` | 多轮循环、消息队列、工具调度、压缩、持久化抽象、执行环境抽象、Durable AgentHarness v2 |
+| 外部入口 | `pi-coding-agent` CLI | 参数解析、模式分发、主函数入口（Node esbuild 单文件 bundle） |
+| 应用/SDK | `pi-coding-agent` | 会话管理、扩展、内置工具、模式实现、配置、Skills、导出、模型解析、OAuth、codemode/MCP 集成 |
+| 能力扩展 | `pi-codemode` | quickjs-wasi 沙箱脚本执行（唯一能力是调用注入工具）、Cloudflare Workers 沙箱 |
+| 能力扩展 | `pi-mcp` | 独立 MCP 客户端（传输、OAuth、工具暴露） |
+| Agent 运行时 | `pi-agent-core` | 多轮循环、消息队列、工具调度（核心循环；持久化/harness 已移出） |
+| 持久运行时（实验性） | `pi-durable` | 事务会话/文档/任务、harness、调度、压缩、watch、图像、存储后端（JSONL/SQLite/Cloudflare DO/memory） |
+| 远程执行 | `pi-env` | SSH 部署的远程执行环境守护进程与 ExecutionEnv 客户端（配合 pi-durable） |
 | LLM 抽象 | `pi-ai` | 多提供商注册、认证、流式请求、协议转换、模型目录、图像生成 |
-| 终端 UI | `pi-tui` | 差分渲染、组件、输入、编辑器、覆盖层、图片/原生修饰键支持 |
+| 组合运行时 | `pi-chord` | 复制状态、RPC、facets/services、插件、delta 引擎、bundler |
+| 终端 UI | `pi-tui` | 差分渲染、组件、输入、编辑器、覆盖层、图片、全屏布局 |
 | 线协议 | `pi-protocol` | schema/类型、CBOR 编解码、字节流 framing、消息校验 |
-| 客户端 | `pi-client` | 传输无关的远程会话客户端（PiClient、SessionLease） |
+| 客户端 | `pi-client` | 传输无关的远程客户端（PiClient） |
+| 服务器（实验性） | `pi-server` | durable Session 路由服务器（Unix socket、附件路由） |
 | 遥测 | `pi-telemetry` | 内存/noop 遥测实现，观测与追踪 |
-| 可选持久化 | `pi-session-backends-sqlite-node` | SQLite 会话后端（自 `pi-storage-sqlite-node` 迁移）、tree/lanes/facts/records 存储 |
 | 评测 | `pi-evals` | 基于 `vitest-evals` 的端到端行为评测 |
 | 示例扩展 | `packages/coding-agent/examples/extensions/*` | 自定义 Provider、沙箱、GitLab Duo 等扩展示例 |
 
@@ -153,9 +180,9 @@ flowchart TB
 
 ### 3.1 CLI 入口
 
-- **Node 入口**：`packages/coding-agent/src/cli.ts` → `dist/cli.js`（`bin "pi"`）。
+- **Node 入口**：`packages/coding-agent/src/cli.ts` → `dist/bundle/cli.js`（`bin "pi"`，esbuild 单文件 Node bundle）。
 - **Bun 二进制入口**：编译后的 `dist/pi` 同样进入 `cli.ts`。
-- **Server 入口**：`packages/server/src/cli.ts` → `serve` / `spawn` / `rpc` / `rpc-stream` / `list` / `status` / `stop` 等子命令。
+- **Server**：`packages/server` 现为纯库（无 CLI、无 bin），供实验代码宿主 durable Session 路由服务器。
 - **Evals 入口**：`npm run eval -w packages/evals` 依次运行宿主机评测与文档对照评测；后者由 `packages/evals/src/cli.ts` 编排，通过 Docker 隔离运行。模型通过 `PI_PROVIDER` / `PI_MODEL` 指定。
 
 ### 3.2 运行模式
@@ -244,6 +271,7 @@ main.ts
 - 在 `agent_start` / `message_end` / `turn_end` 等事件点上持久化会话。
 - 支持 `Skill` 块解析与注入、提示模板展开、HTML 导出。
 - 管理模型解析与运行时（`ModelRuntime`、`ModelResolver`、`ModelRegistry`）。
+- 接入内置扩展 `extensions/mcp`（`pi-mcp` 服务器连接、OAuth 与工具暴露）、`extensions/codemode`（`pi-codemode` 沙箱脚本工具）、`extensions/tool-search` 与 `extensions/llama`。
 - 处理项目信任、凭证、OAuth 与 Radius 集成。
 
 ### 4.3 Agent 循环
@@ -288,7 +316,7 @@ sequenceDiagram
 
 `AgentSession` 通过四种方式与 `Agent` 交互：
 
-1. **事件订阅**：`agent.subscribe(this._handleAgentEvent)` — 接收 `agent_start` / `message_start` / `message_update` / `message_end` / `tool_execution_*` / `turn_end` / `agent_end`，在 `message_end` 时持久化到 `SessionManager`。
+1. **事件订阅**：`agent.subscribe(this._handleAgentEvent)` 返回取消订阅函数（`#9630`）— 接收 `agent_start` / `message_start` / `message_update` / `message_end` / `tool_execution_*` / `turn_end` / `agent_end`，在 `message_end` 时持久化到 `SessionManager`。
 2. **工具拦截钩子**：`agent.beforeToolCall` / `agent.afterToolCall` — 转发给 `ExtensionRunner`，扩展可拦截/修改工具调用。
 3. **prepareNextTurnWithContext**：在每轮 LLM 调用前注入最新的 `systemPrompt` 和 `tools`。
 4. **直接状态读写**：`agent.state.model` / `agent.state.tools` / `agent.state.messages` / `agent.state.systemPrompt`。
@@ -339,18 +367,21 @@ flowchart LR
 
 Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex、Bedrock、Azure OpenAI、Mistral、Cerebras、DeepSeek、Fireworks、Groq、Together、OpenRouter、GitHub Copilot、Cloudflare、Moonshot、Qwen、MiniMax、xAI、ZAI 等数十个 provider，每个 provider 通常包含 `index.ts` 与 `<name>.models.ts` 分别描述能力与模型列表。`images.ts` 与 `image-models.generated.ts` 提供统一的图像生成入口。部分 provider 有特殊行为：xAI 模型统一通过 Responses API 路由（默认 Grok 4.6）；Google 思考级别遵循官方级别映射；Kimi 追踪缓存 token 用量；ZAI 使用中文 Coding Plan 模型目录；废弃的 Xiaomi 模型已移除。
 
-近期提供商兼容与重试行为（截至上游 `5a3a03a7f`）：
+近期提供商兼容与重试行为（截至上游 `e6b9a6af5`，v1.1.0 后）：
 
-- **Google / Vertex 思考级别**：先由 `clampThinkingLevel()` 选择模型支持的级别，再按 `thinkingLevelMap` 映射；两条 API 共用 `google-shared.ts`。例如支持 `medium` 的模型不再被统一提升为 `HIGH`。关闭思考时，支持关闭的模型使用 `thinkingBudget: 0`，不支持的模型使用最低支持级别。
-- **Anthropic 模型标识**：`AssistantMessage.model` 保留请求模型 ID；服务端返回不同名称时另存 `responseModel`，避免别名或回退模型名称变化导致后续 thinking 重放丢失。匹配 `allowedFallbackModels` 时仍使用实际响应模型的费用配置。
-- **暂时性错误识别**：`utils/retry.ts` 将 Cloudflare HTTP 520 和 Azure 的 `currently experiencing high demand` 错误纳入可重试范围；实际重试仍受调用方策略限制。
+- **Google / Vertex 思考级别**：先由 `clampThinkingLevel()` 选择模型支持的级别，再按 `thinkingLevelMap` 映射；两条 API 共用 `google-shared.ts`。关闭思考时，支持关闭的模型使用 `thinkingBudget: 0`，不支持的模型使用最低支持级别。
+- **Anthropic 模型标识与工具**：`AssistantMessage.model` 保留请求模型 ID，服务端返回不同名称时另存 `responseModel`；对话中途新增的工具改为内联定义（不再仅靠首轮 system tools）。Claude Opus/Sonnet/Haiku 5.5 系列改用 models.dev 元数据。
+- **采样参数**：`per-thinking-level` 采样参数（#9776）按思考级别覆盖 temperature/top_p 等；Bedrock Converse 上向 OpenAI 模型发送 reasoning effort（#10142）。
+- **认证**：Anthropic 支持 workload identity federation（#10242）与 copy code 登录（#10194）；Azure 新增 Foundry Chat Completions 部署（#9714）；OpenAI 登录允许应用声明自身名称（#10433）；Radius 提供商目录与 `/login` Radius 登录；Meta（Muse 订阅 OAuth）。
+- **暂时性错误识别**：`utils/retry.ts` 将 Cloudflare HTTP 520、Azure 高峰容量、"Selected model is at capacity"、server-busy、Mistral finish_reason 错误纳入可重试；`Retry-After` 无法解析时退回指数退避；HTTP/2 挂起流取消可重试。
+- **分类器与图像**：OpenAI Decisions 分类器、Cloudflare Clef 分类器（Workers AI）、llama.cpp 分类器模型原生支持（#10382）；请求上下文按 3.5 字符/token 估算，各目录保留 prompt-length 分级计价。
 
 ### 4.5 工具执行
 
 **文件**：
 
 - `packages/coding-agent/src/core/tools/index.ts` — 工厂函数（`createToolDefinition` / `createTool` / `createAllToolDefinitions`）
-- `packages/coding-agent/src/core/tools/read.ts`、`bash.ts`、`edit.ts`、`write.ts`、`grep.ts`、`find.ts`、`ls.ts`
+- `packages/coding-agent/src/core/tools/read.ts`、`bash.ts`、`edit.ts`、`write.ts`、`grep.ts`、`find.ts`、`ls.ts`、`powershell.ts`
 - `packages/coding-agent/src/core/tools/tool-definition-wrapper.ts` — `ToolDefinition` ↔ `AgentTool` 转换
 - `packages/coding-agent/src/core/tools/edit-diff.ts` — diff 计算与 fuzzy match
 - `packages/coding-agent/src/core/tools/output-accumulator.ts` — bash 流式输出累积
@@ -358,11 +389,11 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 - `packages/coding-agent/src/core/tools/file-mutation-queue.ts` — 写操作互斥锁
 - `packages/agent/src/agent-loop.ts` 中 `executeToolCalls()`
 
-注：`coding-agent` 有自己独立的工具实现（`packages/coding-agent/src/core/tools/`），与 `agent-core` 内部 `packages/agent/src/harness/tools/` 的通用实现无关。
+注：`coding-agent` 有自己独立的工具实现（`packages/coding-agent/src/core/tools/`）；`agent-core` 原有的通用工具实现（`src/harness/tools/`）已随 harness 迁出（`pi-durable` 自带 `src/tools/`），两者互不相关。
 
 工具注册：
 
-- `AgentSession._buildRuntime()` → `createAllToolDefinitions()` 生成内置工具定义（`{read, bash, edit, write, grep, find, ls}`）→ 存入 `_baseToolDefinitions`。
+- `AgentSession._buildRuntime()` → `createAllToolDefinitions()` 生成内置工具定义（`{read, bash, edit, write, grep, find, ls, powershell}`）→ 存入 `_baseToolDefinitions`。
 - 扩展通过 `api.registerTool()` → `ExtensionRunner` → `AgentSession._refreshToolRegistry()` 合并到 `_toolDefinitions` 和 `_toolRegistry`。
 - `_refreshToolRegistry()` 合并三路来源：`_baseToolDefinitions` + 扩展注册工具 + SDK 自定义工具，同名工具以扩展/SDK 优先（可覆盖内置工具）。
 - `setActiveToolsByName()` → `agent.state.tools = [...]` + 重建 `systemPrompt`。
@@ -383,6 +414,7 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 |------|--------|------|------|------|---------|
 | `read` | path/offset/limit | 否 | truncateHead 2000行/50KB | 无 | 图片检测/resize、紧凑渲染分类（docs/skill/resource） |
 | `bash` | command/timeout | 是（100ms 节流） | truncateTail + temp 文件 | 无 | 进程树管理、命令前缀、PI_* 环境变量注入 |
+| `powershell` | 同 bash（`PowerShellToolInput = BashToolInput`） | 同 bash | 同 bash | 无 | PowerShell 执行（Windows 场景），注入 UTF-8 输出编码前缀，复用 bash 的操作抽象 |
 | `edit` | path/edits[] | 否 | 无 | fileMutationQueue | fuzzy match（NFKC/引号/空白/破折号）、异步 diff 预览 |
 | `write` | path/content | 是（增量高亮） | 无 | fileMutationQueue | 自动创建父目录、流式语法高亮缓存 |
 | `grep` | pattern/path/glob/context/limit | 否 | match limit(100) + 行(500ch) + bytes(50KB) | 无 | 依赖 ripgrep、`.gitignore` 感知 |
@@ -396,8 +428,10 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 - `packages/tui/src/tui.ts`
 - `packages/tui/src/terminal.ts`
 - `packages/tui/src/stdin-buffer.ts`、`keys.ts`、`keybindings.ts`
+- `packages/tui/src/layout.ts`、`layout-node.ts`、`tui-alt-screen.ts`、`tui-main-screen.ts`、`wheel-scroll.ts`、`alt-screen-search.ts`
 - `packages/tui/src/autocomplete.ts`、`fuzzy.ts`、`kill-ring.ts`、`undo-stack.ts`、`word-navigation.ts`
-- `packages/tui/src/terminal-image.ts`、`native-modifiers.ts`
+- `packages/tui/src/terminal-image.ts`、`native-modifiers.ts`、`native-platform.ts`、`program-status.ts`（OSC 7501 状态上报）
+- `packages/tui/src/colors.ts`、`oklab.ts`、`latex.ts`
 - `packages/tui/src/components/*.ts`
 - `packages/coding-agent/src/modes/interactive/interactive-mode.ts`
 - `packages/coding-agent/src/modes/interactive/components/*.ts`
@@ -460,6 +494,7 @@ flowchart TB
 10. 覆盖层（如模型选择器、会话选择器、主题选择器、思考级别选择器）通过 `showOverlay()` 居中弹出，关闭后焦点返回编辑器。
 11. `terminal-image.ts` 与 `native-modifiers.ts` 提供终端图片预览和原生修饰键检测（Windows/macOS 预编译二进制）。
 12. 主题：首次运行检测终端背景自动选择 `dark`/`light`；`--use-theme <name>`（或 `light/dark` 终端感知对）可为单次运行设置初始主题而不修改保存的设置，后续在 `/settings` 中切换会立即生效并正常保存。
+13. 全屏布局：默认 TUI 模式为 fullscreen（设置 `tuiMode: "fullscreen"`），使用备用屏布局根、滚轮滚动加速（`wheel-scroll.ts`）、alt-screen 内搜索与退出转场（`fullscreenExitOutput`）；传统内联模式可经设置切回。
 
 ### 4.7 上下文压缩
 
@@ -521,60 +556,35 @@ Session 文件结构变为：
 
 ### 4.8 会话存储抽象
 
+**背景**：`pi-agent-core` 原有的实验性 harness（`packages/agent/src/harness/`：会话树抽象、`SessionStorage` 接口、JSONL/SQLite 后端、跨会话搜索）已于上游迁出——会话/存储实现进入 `packages/durable`，跨会话搜索（`packages/agent/src/search/`）被移除，`packages/session-backends/sqlite-node` 包随之删除。`packages/agent/docs/harness.md` 规范同样移除，由 `packages/durable/docs/spec.md` 取代。
+
 **文件**：
 
-- `packages/agent/src/harness/types.ts`
-- `packages/agent/src/harness/session/session.ts`、`state.ts`、`context.ts`、`types.ts`、`index.ts`
-- `packages/agent/src/harness/session/jsonl/`（`repo.ts`、`storage.ts`、`codec.ts`、`errors.ts`、`types.ts`）
-- `packages/agent/src/harness/session/jsonl/v3.ts`（coding-agent v3 格式兼容层）
-- `packages/agent/src/harness/session/memory.ts`
-- `packages/agent/src/harness/session/testing/`（`conformance.ts`）
-- `packages/agent/src/search/`（`scanning.ts`、`index.ts`）— 基于 SessionStorage 的会话搜索
-- `packages/agent/src/harness/events.ts`、`reducer.ts`、`result.ts`、`telemetry.ts` — AgentHarness v2 事件/规约/结果/遥测
-- `packages/session-backends/sqlite-node/src/sqlite/`（`repo.ts`、`storage/`、`migrations/`、`search-backend.ts`、`branch-cache.ts`、`sql.ts`）
+- `packages/durable/src/session/`（`session.ts`、`transaction.ts`、`forks.ts`、`observation.ts`）— 事务会话与文档
+- `packages/durable/src/harness/`（`harness.ts`、`agent.ts`、`scheduler.ts`、`inbox.ts`、`submissions.ts`、`task-graph.ts`、`compaction.ts`、`view.ts`、`registry.ts` 等）— durable harness 与任务运行时
+- `packages/durable/src/storage/`（`jsonl/`、`sqlite/`、`memory.ts`、`scan.ts`）— 存储后端
+- `packages/durable/src/documents.ts`、`entries.ts`、`tasks.ts`、`images/`、`env/`、`tools/`
+- `packages/durable/docs/spec.md` — 规范（Packages 15–23：首个 chat turn → 生命周期 → 扩展）
+- `packages/coding-agent/src/core/session-manager.ts` — coding-agent 自身的 JSONL 会话管理（与 pi-durable 并行，主 CLI 仍使用）
 
-`pi-agent-core` 将会话持久化抽象为 `SessionStorage` 接口：
+`pi-durable`（实验性）的核心模型：
+
+1. **先落盘再展示**：会话、模型轮次、工具调用与应用状态先提交存储，进程死亡后重开存储从断点继续（"效果三明治"：intent → 执行 → settlement）。
+2. **事务会话与文档**：版本化文档、fork、checkpoint、迁移；文档状态基于 `chord` 的 operation log/delta；`documentRetentionMs` 按使用度约束文档缓存内存。
+3. **任务运行时（TaskRuntime）**：结构化并发——任务 ownership、等待/完成 holds、自底向上中止、嵌套调用（每个嵌套调用一个文档）、inbox/submissions、task graph 视图；调度器索引只按活跃工作约束内存。
+4. **压缩与溢出**：durable 侧 compaction/overflow（Package 20）。
+5. **其他**：`FileSystem.watch`（Windows 上退化为轮询）、有界二进制/目录读取、图像读取（Photon worker 线程准备）、按 SQL 文本执行并缓存语句的异步 SQLite。
+
+存储后端：
 
 | 后端 | 实现 | 说明 |
 |------|------|------|
-| JSONL | `JsonlSessionStorage` / `JsonlSessionRepo`（`jsonl/` 目录） | 默认后端，每个会话一个 `.jsonl` 文件，兼容旧格式与 coding-agent v3 格式 |
-| Memory | `MemorySessionStorage` / `MemorySessionRepo`（`memory.ts`） | 内存中，测试/评测使用 |
-| SQLite | `SqliteSessionStorage` / `SqliteSessionRepo` | 可选后端，位于 `packages/session-backends/sqlite-node`（自 `packages/storage/sqlite-node` 迁移），基于 `node:sqlite`，实现 entries/lanes/facts/records 四类存储 + 分支缓存 + 搜索后端 |
+| JSONL | `packages/durable/src/storage/jsonl/` | Node 端 JSONL 存储 |
+| SQLite | `packages/durable/src/storage/sqlite/` | `node:sqlite` 实现 + Cloudflare Durable Object（`cloudflare.ts`）适配器，含迁移 |
+| Memory | `packages/durable/src/storage/memory.ts` | 内存实现，测试用 |
+| 扫描 | `packages/durable/src/storage/scan.ts` | 有界扫描（会话/条目/任务/提交按任意顺序扫描） |
 
-会话搜索：`packages/agent/src/search/scanning.ts` 提供 `createScanningSessionSearch()`，通过扫描 SessionStorage 的元数据/条目/标签实现跨会话搜索（支持条目类型过滤、限制命中数、AbortSignal 取消）。
-
-#### Durable AgentHarness v2（`packages/agent/docs/harness.md`）
-
-pi 2.0 的核心架构更新。会话由四部分组成：
-
-1. **Entry tree（条目树）**：不可变消息/压缩/分支摘要/自定义条目，`parentId` 链接，只追加。
-2. **Facts（事实）**：可变、命名空间的键值状态（会话名、标签、应用自定义事实）。
-3. **Lanes（泳道）**：树的命名游标。每个会话必有 `main`；一个 lane 拥有自己的 leaf、模型配置、队列和最多一个运行中操作。支持 Slack 线程、子代理等并行工作。
-4. **Usage ledger（用量账本）**：追加式 token/成本事件。
-
-存储层三存储模型：
-
-- `entries` — 写一次、只追加的会话树
-- `registers` — 可变命名空间单元格（`op.meta` 写一次、`op.state` 每次转换整体覆盖）
-- `usage ledger` — 追加式成本行
-
-关键机制：
-
-- **原子事务**：条目插入 + 用量插入 + 寄存器写入，全有或全无，严格递增序列号。
-- **持久化程序计数器**：每步后整体覆盖 `op.state/{operationId}`，恢复时读取该寄存器而非重放日志。
-- **效果三明治（effect sandwich）**：provider 请求和工具调用被两次提交包裹（intent → 执行 → settlement），崩溃可恢复。
-- **确定性步进**：所有效果跨注入边界；`drive: "manual"` 模式下测试逐调用驱动。
-
-兼容性策略：旧 coding-agent v3 JSONL 会话必须能打开并恢复 idle；其余格式/API 可破坏。
-
-`SessionStorage` 职责：
-
-- 追加 `SessionTreeEntry`（消息、模型变更、压缩、分支摘要、自定义条目等）。
-- 维护当前 `leafId` 与会话树分支。
-- 提供 `getPathToRootOrCompaction()` 构建模型上下文。
-- 物化会话统计（token、工具调用数）与标签。
-
-`coding-agent` 当前默认仍使用 JSONL 的 `SessionManager`（在 `packages/coding-agent/src/core/session-manager.ts` 中），该管理器内部实现与 `pi-agent-core` 的抽象并行演进；`pi-session-backends-sqlite-node` 则为需要 SQLite 后端的调用方提供即插即用实现。
+`coding-agent` 主 CLI 当前默认仍使用自己的 JSONL `SessionManager`（`packages/coding-agent/src/core/session-manager.ts`），与 `pi-durable` 的存储抽象并行；`pi-durable` 通过 `coding-agent/src/experimental/durable/`（durable TUI：单进程拥有模型运行时、durable harness、SQLite 存储与 TUI）与 `experimental/vacation/`（示例应用）落地。
 
 ### 4.9 Skills、提示模板与扩展系统
 
@@ -584,8 +594,6 @@ pi 2.0 的核心架构更新。会话由四部分组成：
 - `packages/coding-agent/src/core/prompt-templates.ts`
 - `packages/coding-agent/src/core/system-prompt.ts`
 - `packages/coding-agent/src/core/slash-commands.ts`
-- `packages/agent/src/harness/skills.ts`
-- `packages/agent/src/harness/prompt-templates.ts`
 
 Skills：
 
@@ -620,9 +628,12 @@ Skills：
 - OAuth 提供者、凭证存储、Radius 集成。
 - 生命周期钩子：`onAgentStart`、`beforeToolCall`、`afterToolCall`、`beforeProviderRequest`、`afterProviderResponse` 等。
 
-内置扩展：
+内置扩展（`packages/coding-agent/src/extensions/`）：
 
-- `packages/coding-agent/src/extensions/llama/`：本地 LLaMA 推理支持（`client.ts`、`provider.ts`、`ui.ts`、`huggingface.ts`、`index.ts`）。模型发现允许网络请求，sleeping 中的模型也会暴露；guidance 无默认值。若路由器以 `--no-models-autoload` 启动，`/login llama.cpp` 仅保存连接，需 `/llama` 加载模型后再 `/model` 选择。
+- `mcp/`：包装 `pi-mcp` 客户端——服务器连接、OAuth（动态客户端注册、RFC 9207 `iss` 校验、step-up 授权、按服务器名+URL 存储凭证）、`/mcp` 命令、工具暴露与 pattern 过滤（`--tools`、`--no-mcp`、工具 pattern）。
+- `codemode/`：包装 `pi-codemode`——quickjs 沙箱脚本工具（唯一能力是调用注入的工具）、脚本输出上限与 `image()` 输出保存临时文件、分类器与嵌套工具用量计入会话成本。
+- `tool-search/`：MCP 工具按需搜索加载（reload 后恢复已加载工具）。
+- `llama/`：本地 LLaMA 推理支持（`client.ts`、`provider.ts`、`ui.ts`、`huggingface.ts`、`index.ts`）。模型发现允许网络请求，sleeping 中的模型也会暴露；guidance 无默认值。若路由器以 `--no-models-autoload` 启动，`/login llama.cpp` 仅保存连接，需 `/llama` 加载模型后再 `/model` 选择。
 
 ### 4.10 HTML 会话导出
 
@@ -641,65 +652,52 @@ Skills：
 
 ---
 
-## 5. Server 多实例架构
+## 5. Server：durable Session 路由（实验性）
 
 **文件**：
 
-- `packages/server/src/serve.ts`
-- `packages/server/src/supervisor.ts`
-- `packages/server/src/rpc-process.ts`
-- `packages/server/src/handler.ts`
-- `packages/server/src/ipc/server.ts`、`ipc/client.ts`、`ipc/protocol.ts`
+- `packages/server/src/server.ts` — 路由服务器主体（`ServerHost`、`RoutedServerServiceHost`、`RoutedSessionHandle`）
+- `packages/server/src/session-router.ts` — 会话路由与附件管理
+- `packages/server/src/connection.ts`、`listener.ts` — 连接与监听
+- `packages/server/src/transports/` — 传输实现（`pi-server/unix` 提供 Unix socket）
+- `packages/server/src/errors.ts`、`types.ts`、`index.ts`
+
+上游已移除旧的多实例守护进程（`serve`/`spawn`/`rpc-stream` 子命令、`ServerSupervisor`、`instances.json`、Radius 注册）。现在的 `pi-server` 是一个纯库：
 
 ```mermaid
 flowchart TB
     subgraph Client["外部客户端"]
-        Cli[server cli]
-        Radius[Radius 中继]
+        App[应用 / pi-client]
     end
 
-    subgraph Daemon["server 守护进程"]
-        Socket[server.sock]
-        Server[ipc/server.ts]
-        Handler[handler.ts]
-        Supervisor[ServerSupervisor]
-        RpcProcess[RpcProcessInstance]
+    subgraph ServerProc["pi-server（宿主进程内）"]
+        Unix[Unix socket listener]
+        Router[Session 路由]
+        SessionDir["SessionDirectory（应用实现）"]
+        SessionMgmt["SessionManagement（应用实现）"]
     end
 
-    subgraph AgentProc["Agent 子进程"]
-        CodingAgentRpc[pi --mode rpc]
+    subgraph Workers["durable Session worker"]
+        Harness["pi-durable Harness"]
+        Store[(SQLite / JSONL)]
     end
 
-    Cli -->|spawn / status / stop| Socket
-    Radius --> Socket
-    Socket --> Server
-    Server -->|one-shot| Handler
-    Server -->|rpc_stream| Handler
-    Handler --> Supervisor
-    Supervisor -->|spawn| RpcProcess
-    RpcProcess -->|stdin/stdout JSONL| CodingAgentRpc
+    App -->|attach / invokeService| Unix
+    Unix --> Router
+    Router --> SessionDir
+    Router --> SessionMgmt
+    SessionMgmt -->|open routed session| Harness
+    Harness --> Store
 ```
 
-实例生命周期：
+职责划分：
 
-1. `spawn`：创建 `InstanceRecord`，持久化到 `instances.json`，启动子进程。
-2. `bindRpcProcess()`：将子进程 stdout 的 JSONL 事件转发给订阅者。
-3. `syncInstanceRecord()`：发送 `get_state` RPC，保存 `sessionId` / `sessionFile`。
-4. `radiusPresence.registerPi()`：可选注册到 Radius 中继。
-5. `rpc_stream`：客户端与 server 建立长连接，server 与子进程 stdin/stdout 桥接，实现双向 JSONL 流。
-6. `stop`：清理订阅、断开 Radius、发送 SIGTERM、更新状态为 `stopped`。
+1. **应用持有目录与管理**：`SessionDirectory` 把私有会话目录投影为复制后的呈现安全状态；`SessionManagement` 创建、删除、挂载（attach）、卸载会话，路由 ID 不进入业务结果。
+2. **附件路由**：`attachClient()` 建立连接级服务端点；同一连接重复 attach 幂等，每个成功附件有服务器生成的 `attachmentId`（仅作为路由控制数据下发）。会话请求携带 `{serverId, sessionId, attachmentId}`，过期或不匹配的路由被拒绝；连接丢失时拒绝其本地响应，待已受理的服务调用结算后释放附件。
+3. **不透明转发**：`invokeService()` 把不透明的 service/member 信封转发给所选 Session 端点，服务器校验附件路由但不加载 facet 契约、不解码业务负载；订阅更新只发回请求附件。一个会话可有多个呈现附件。
+4. **worker 生命周期**：宿主决定何时在零呈现需求且 worker 内 Harness 空闲时退役 worker；服务器关闭时关闭所有路由 Session 句柄，释放 worker 与 Session 写者所有权。
 
-CLI 命令：
-
-```bash
-server serve
-server list
-server spawn [--cwd <path>] [--label <label>]
-server status <instance-id>
-server stop <instance-id>
-server rpc <instance-id> <json-command>
-server rpc-stream <instance-id>
-```
+`coding-agent` 侧的实验接入（`PI_EXPERIMENTAL=1`）：`src/experimental/` 下的 `client.ts`/`client-tui.ts`（实验客户端与 TUI）、`coordinator.ts`、`session-worker-manager.ts`、`server.ts` 与 `radius-relay.ts`（Radius 中继），通过 devDependencies 引入 `pi-client`/`pi-protocol`/`pi-server`。
 
 ---
 
@@ -743,14 +741,11 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 |------|------|------|
 | Agent 配置目录 | `~/.pi/agent/`（可通过 `PI_CODING_AGENT_DIR` 覆盖） | 所有 coding-agent 数据根目录 |
 | 会话历史（JSONL） | `~/.pi/agent/sessions/<encoded-cwd>/<id>.jsonl` | 树状结构的消息、模型变更、思考级别变更、压缩摘要 |
-| 会话历史（SQLite） | `<db-path>`（可配置） | 可选 `SqliteSessionRepo` 持久化（`packages/session-backends/sqlite-node`），含 entries / lanes / facts / records 等表 + 分支缓存 + 搜索后端 |
+| 会话历史（SQLite，实验性） | `<db-path>`（可配置） | `pi-durable` 的 SQLite 存储后端（`node:sqlite` + Cloudflare Durable Object 适配器），服务实验性 durable harness |
 | 设置 | `~/.pi/agent/settings.json` | 用户偏好、模型、Provider 凭证引用 |
 | 凭证 | 系统密钥存储 / `~/.pi/agent/credentials` | API key / OAuth token（由 `CredentialStore` 抽象） |
 | 模型缓存 | `~/.pi/agent/models.json` | 各 Provider 的动态模型列表缓存 |
-| Server IPC socket | `~/.pi/server/server.sock` | Unix Domain Socket 监听地址 |
-| Server 实例 | `~/.pi/server/instances.json` | 实例元数据 |
-| Server 机器身份 | `~/.pi/server/machine.json` | Radius 注册信息 |
-| Server 凭证 | `~/.pi/server/auth.json` | server 自身认证信息 |
+| Server Unix socket（实验性） | 由 `pi-server/unix` 的 `getUnixSocketPath()` 决定 | 实验路由服务器监听地址 |
 
 会话条目类型（`SessionTreeEntry`）：
 
@@ -769,21 +764,17 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 
 ## 8. 关键文件索引
 
-### Server
+### Server（实验性）
 
 | 文件 | 职责 |
 |------|------|
-| `packages/server/src/cli.ts` | server 命令行入口 |
-| `packages/server/src/serve.ts` | 守护进程启动、优雅退出 |
-| `packages/server/src/supervisor.ts` | 实例生命周期监管 |
-| `packages/server/src/rpc-process.ts` | Agent 子进程封装与 JSONL 通信 |
-| `packages/server/src/handler.ts` | IPC 请求路由与 rpc_stream 升级 |
-| `packages/server/src/ipc/server.ts` | Unix socket 服务器、流升级 |
-| `packages/server/src/ipc/client.ts` | IPC 客户端 |
-| `packages/server/src/ipc/protocol.ts` | IPC 消息协议类型 |
-| `packages/server/src/radius.ts` | Radius 中继注册与心跳 |
-| `packages/server/src/storage.ts` | instances.json / machine.json 持久化 |
-| `packages/server/src/config.ts` | socket / auth / instances / machine 路径集中配置 |
+| `packages/server/src/server.ts` | 路由服务器主体（`ServerHost`、`RoutedServerServiceHost`、`RoutedSessionHandle`） |
+| `packages/server/src/session-router.ts` | 会话路由与附件管理 |
+| `packages/server/src/connection.ts` | 连接生命周期 |
+| `packages/server/src/listener.ts` | 监听器 |
+| `packages/server/src/transports/` | 传输实现（`pi-server/unix` 导出 Unix socket） |
+| `packages/server/src/errors.ts` | 错误类型（`SessionNotFoundError` 等） |
+| `packages/server/src/types.ts` | 路由/附件类型 |
 | `packages/server/src/index.ts` | server 公共导出 |
 
 ### Coding Agent
@@ -795,7 +786,7 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/sdk.ts` | 程序化 SDK：`createAgentSession()` |
 | `packages/coding-agent/src/core/agent-session-services.ts` | 按 cwd 构建服务 |
 | `packages/coding-agent/src/core/agent-session-runtime.ts` | 运行时与会话切换 |
-| `packages/coding-agent/src/core/agent-session.ts` | 核心会话抽象与事件流（~3300行） |
+| `packages/coding-agent/src/core/agent-session.ts` | 核心会话抽象与事件流（~4400行） |
 | `packages/coding-agent/src/core/session-manager.ts` | JSONL 会话管理 |
 | `packages/coding-agent/src/core/model-runtime.ts` | 模型运行时与调度 |
 | `packages/coding-agent/src/core/model-resolver.ts` | 模型字符串解析 |
@@ -809,6 +800,15 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/provider-composer.ts` | Provider 组合（扩展自定义 provider/OAuth 配置） |
 | `packages/coding-agent/src/core/provider-attribution.ts` | Provider 归属跟踪 |
 | `packages/coding-agent/src/core/settings-manager.ts` | 用户设置读写 |
+| `packages/coding-agent/src/core/settings-defaults.ts` | 设置默认值（`tuiMode: "fullscreen"` 等） |
+| `packages/coding-agent/src/core/settings-schema.ts` | 设置 schema（随配置 schema 发布） |
+| `packages/coding-agent/src/core/cache-warmer.ts` | 提示缓存预热（#9668） |
+| `packages/coding-agent/src/core/bug-report.ts` | bug 报告生成与离线拒绝 |
+| `packages/coding-agent/src/core/mcp-servers.ts` | MCP 服务器配置解析（项目 mcp.json 覆盖全局启用/暴露） |
+| `packages/coding-agent/src/core/nested-tool-calls.ts` | 嵌套工具调用 |
+| `packages/coding-agent/src/core/session-export.ts` | 会话导出 |
+| `packages/coding-agent/src/core/experimental.ts` | 实验特性开关（`PI_EXPERIMENTAL=1`） |
+| `packages/coding-agent/src/core/defaults.ts` | 默认值常量 |
 | `packages/coding-agent/src/core/resolve-config-value.ts` | 配置值解析（env/命令/值） |
 | `packages/coding-agent/src/core/resource-loader.ts` | Skill / 提示模板 / 主题资源加载 |
 | `packages/coding-agent/src/core/trust-manager.ts` | 项目信任与权限决策 |
@@ -846,6 +846,7 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/tools/grep.ts` | grep 工具实现（ripgrep JSON 流） |
 | `packages/coding-agent/src/core/tools/find.ts` | find 工具实现 |
 | `packages/coding-agent/src/core/tools/ls.ts` | ls 工具实现 |
+| `packages/coding-agent/src/core/tools/powershell.ts` | PowerShell 工具实现（复用 bash 操作抽象） |
 | `packages/coding-agent/src/core/tools/output-accumulator.ts` | bash 流式输出累积与截断 |
 | `packages/coding-agent/src/core/tools/truncate.ts` | 通用截断（2000 行 / 50KB / 500ch 每行） |
 | `packages/coding-agent/src/core/tools/file-mutation-queue.ts` | 写操作互斥锁 |
@@ -857,7 +858,7 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/slash-commands.ts` | slash 命令解析与分发 |
 | `packages/coding-agent/src/core/export-html/index.ts` | 会话 HTML 导出 |
 | `packages/coding-agent/src/modes/print-mode.ts` | 一次性文本/JSON 模式 |
-| `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | 交互式 TUI 模式（~6400行） |
+| `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | 交互式 TUI 模式（~7100行，默认全屏布局） |
 | `packages/coding-agent/src/modes/rpc/` | RPC 模式 |
 | `packages/coding-agent/src/rpc-entry.ts` | server 子进程 RPC 入口 |
 | `packages/coding-agent/src/bun/cli.ts` | Bun 二进制入口包装 |
@@ -866,56 +867,14 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 
 | 文件 | 职责 |
 |------|------|
-| `packages/agent/src/agent.ts` | 有状态 Agent 包装器（~600行） |
-| `packages/agent/src/agent-loop.ts` | 多轮 LLM/工具循环（~800行） |
+| `packages/agent/src/agent.ts` | 有状态 Agent 包装器（~610行） |
+| `packages/agent/src/agent-loop.ts` | 多轮 LLM/工具循环（~950行） |
 | `packages/agent/src/types.ts` | 核心类型 |
 | `packages/agent/src/stream-fn.ts` | 默认流函数 |
 | `packages/agent/src/proxy.ts` | Agent 代理 |
-| `packages/agent/src/search/index.ts` | 会话搜索入口 |
-| `packages/agent/src/node.ts` | Node 环境导出 |
 | `packages/agent/src/index.ts` | 公共导出 |
-| `packages/agent/src/harness/agent-harness.ts` | 生产级 harness（注：`coding-agent` 不使用此文件，由 `AgentSession` 直接替换） |
-| `packages/agent/src/harness/types.ts` | harness 类型：FileSystem、ExecutionEnv、SessionStorage、Result |
-| `packages/agent/src/harness/events.ts` | AgentHarness v2 事件订阅接口 |
-| `packages/agent/src/harness/reducer.ts` | AgentHarness v2 状态规约 |
-| `packages/agent/src/harness/result.ts` | 运行结果类型 |
-| `packages/agent/src/harness/telemetry.ts` | harness 遥测接入 |
-| `packages/agent/docs/harness.md` | Durable AgentHarness v2 实现规范（~2900行） |
-| `packages/agent/docs/search.md` | 会话搜索服务规范 |
-| `packages/agent/docs/telemetry-schema.md` | 遥测 schema |
-| `packages/agent/src/harness/session/session.ts` | 树状会话抽象与上下文构建 |
-| `packages/agent/src/harness/session/state.ts` | 会话状态 |
-| `packages/agent/src/harness/session/context.ts` | 上下文构建 |
-| `packages/agent/src/harness/session/types.ts` | 会话类型定义 |
-| `packages/agent/src/harness/session/jsonl/repo.ts` | JSONL 会话仓库 |
-| `packages/agent/src/harness/session/jsonl/storage.ts` | JSONL SessionStorage 实现 |
-| `packages/agent/src/harness/session/jsonl/codec.ts` | JSONL 编解码 |
-| `packages/agent/src/harness/session/jsonl/errors.ts` | JSONL 错误类型 |
-| `packages/agent/src/harness/session/jsonl/v3.ts` | coding-agent v3 格式兼容层 |
-| `packages/agent/src/harness/session/memory.ts` | 内存 SessionStorage 实现 |
-| `packages/agent/src/harness/session/testing/conformance.ts` | 会话后端一致性测试 |
-| `packages/agent/src/search/scanning.ts` | 基于扫描的会话搜索 |
-| `packages/agent/src/search/index.ts` | SessionSearch 公共导出 |
-| `packages/agent/src/harness/env/nodejs.ts` | Node.js 文件系统/Shell 执行环境实现 |
-| `packages/agent/src/harness/compaction/compaction.ts` | 上下文压缩（注：`coding-agent` 有独立实现） |
-| `packages/agent/src/harness/compaction/branch-summarization.ts` | 分支摘要 |
-| `packages/agent/src/harness/compaction/utils.ts` | 压缩工具 |
-| `packages/agent/src/harness/prompt-templates.ts` | 提示词模板加载 |
-| `packages/agent/src/harness/skills.ts` | harness 层 Skill 注入 |
-| `packages/agent/src/harness/system-prompt.ts` | 系统提示词构建 |
-| `packages/agent/src/harness/messages.ts` | 消息工具 |
-| `packages/agent/src/harness/tools/index.ts` | harness 工具工厂 |
-| `packages/agent/src/harness/tools/bash.ts` | bash 工具实现 |
-| `packages/agent/src/harness/tools/read.ts` | read 工具实现 |
-| `packages/agent/src/harness/tools/edit.ts` | edit 工具实现 |
-| `packages/agent/src/harness/tools/edit-diff.ts` | diff 计算 |
-| `packages/agent/src/harness/tools/write.ts` | write 工具实现 |
-| `packages/agent/src/harness/tools/image.ts` | 图片工具辅助 |
-| `packages/agent/src/harness/tools/file-mutation-queue.ts` | 文件变更队列 |
-| `packages/agent/src/harness/tools/path-utils.ts` | 路径解析 |
-| `packages/agent/src/harness/tools/tool-context.ts` | 工具上下文 |
-| `packages/agent/src/harness/utils/shell-output.ts` | shell 输出工具 |
-| `packages/agent/src/harness/utils/truncate.ts` | 截断工具 |
+
+注：原 `packages/agent/src/harness/`（会话树抽象、`SessionStorage`、JSONL/SQLite 后端）、`src/search/` 与 `docs/harness.md` 已随实验 harness 迁出至 `pi-durable` / 移除，见第 4.8 节。
 
 ### AI
 
@@ -949,24 +908,33 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | 文件 | 职责 |
 |------|------|
 | `packages/tui/src/tui.ts` | TUI 根容器、差分渲染、焦点、覆盖层 |
+| `packages/tui/src/layout.ts`、`layout-node.ts` | 全屏布局引擎 |
+| `packages/tui/src/tui-alt-screen.ts`、`tui-main-screen.ts` | 备用屏/主屏模式 |
 | `packages/tui/src/terminal.ts` | 终端抽象、协议协商 |
 | `packages/tui/src/stdin-buffer.ts` | 原始输入缓冲与序列切分 |
 | `packages/tui/src/keys.ts` | 按键序列解析 |
 | `packages/tui/src/keybindings.ts` | 快捷键注册 |
+| `packages/tui/src/wheel-scroll.ts` | 全屏滚轮滚动（自动加速） |
+| `packages/tui/src/alt-screen-search.ts` | 全屏内搜索 |
 | `packages/tui/src/components/editor.ts` | 多行编辑器 |
 | `packages/tui/src/components/markdown.ts` | Markdown 渲染 |
 | `packages/tui/src/components/select-list.ts` | 选择列表 |
+| `packages/tui/src/components/settings-list.ts` | 设置列表 |
 | `packages/tui/src/components/box.ts` | 带背景的容器 |
 | `packages/tui/src/components/image.ts` | 终端图片组件 |
 | `packages/tui/src/components/input.ts` | 单行输入组件 |
 | `packages/tui/src/components/loader.ts` | 加载动画 |
+| `packages/tui/src/components/scroll-view.ts`、`mouse-region.ts`、`stack.ts`/`h-stack.ts`/`v-stack.ts`、`text.ts` | 布局与交互基础组件 |
+| `packages/tui/src/colors.ts`、`oklab.ts` | 颜色值与主题 styling（#8398） |
+| `packages/tui/src/latex.ts` | LaTeX 兼容渲染 |
+| `packages/tui/src/program-status.ts` | OSC 7501 程序状态上报 |
 | `packages/tui/src/autocomplete.ts` | 编辑器自动补全 |
 | `packages/tui/src/fuzzy.ts` | 模糊匹配 |
 | `packages/tui/src/kill-ring.ts` | kill-ring 剪贴 |
 | `packages/tui/src/undo-stack.ts` | 编辑器撤销栈 |
 | `packages/tui/src/word-navigation.ts` | 单词级光标移动 |
 | `packages/tui/src/terminal-image.ts` | 终端图片渲染 |
-| `packages/tui/src/native-modifiers.ts` | 原生修饰键检测 |
+| `packages/tui/src/native-modifiers.ts`、`native-platform.ts` | 原生修饰键检测 |
 
 ### Protocol (线协议)
 
@@ -976,7 +944,7 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/protocol/src/cbor/decoder.ts` | CBOR 解码器 |
 | `packages/protocol/src/cbor/options.ts` | CBOR 选项 |
 | `packages/protocol/src/framing.ts` | 字节流 framing（4 字节长度前缀 + CBOR 项） |
-| `packages/protocol/src/schemas.ts` | 消息 schema（hello、request/response、event 信封） |
+| `packages/protocol/src/protocol.ts` | 消息 schema（hello、request/response、event 信封） |
 | `packages/protocol/src/codec.ts` | 客户端/服务端消息编解码与校验 |
 | `packages/protocol/src/index.ts` | 公共导出 |
 
@@ -986,12 +954,47 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 |------|------|
 | `packages/client/src/client.ts` | `PiClient`：连接、会话管理、快照订阅 |
 | `packages/client/src/connection.ts` | 连接生命周期与重连 |
-| `packages/client/src/session-handle.ts` | `SessionLease`：会话句柄（prompt/subscribe/acquire） |
 | `packages/client/src/transport.ts` | `ByteTransport` 接口 |
-| `packages/client/src/state.ts` | 客户端快照状态 |
 | `packages/client/src/unix.ts` | Unix socket 传输 |
+| `packages/client/src/promise.ts` | Promise 辅助 |
 | `packages/client/src/errors.ts` | 错误类型 |
 | `packages/client/src/types.ts` | 客户端类型 |
+
+### Durable（实验性持久运行时）
+
+| 文件 | 职责 |
+|------|------|
+| `packages/durable/src/harness/harness.ts` | durable Harness（registry、会话配置） |
+| `packages/durable/src/harness/scheduler.ts` | 任务调度（ownership 索引按活跃工作约束） |
+| `packages/durable/src/harness/inbox.ts`、`submissions.ts` | 任务收件箱与提交 |
+| `packages/durable/src/harness/task-graph.ts` | 任务图视图 |
+| `packages/durable/src/harness/compaction.ts` | durable 压缩与溢出 |
+| `packages/durable/src/session/session.ts` | 事务会话（`documentRetentionMs` 约束文档缓存） |
+| `packages/durable/src/session/transaction.ts`、`forks.ts` | 事务与文档 fork |
+| `packages/durable/src/documents.ts` | 版本化文档（chord 状态） |
+| `packages/durable/src/storage/jsonl/` | JSONL 存储后端 |
+| `packages/durable/src/storage/sqlite/` | SQLite 后端（`node.ts`：node:sqlite；`cloudflare.ts`：Durable Object） |
+| `packages/durable/src/storage/scan.ts` | 有界扫描（会话/条目/任务/提交） |
+| `packages/durable/src/images/` | 图像处理（`node-worker.ts` worker 线程准备） |
+| `packages/durable/src/env/` | ExecutionEnv 抽象（配合 pi-env） |
+| `packages/durable/docs/spec.md` | 规范（Packages 15–23） |
+
+### Codemode / MCP / Env / Chord
+
+| 文件 | 职责 |
+|------|------|
+| `packages/codemode/src/runtime/` | quickjs-wasi 沙箱运行时（工具注入、输出上限） |
+| `packages/codemode/src/cloudflare.ts` | Cloudflare Workers 远程 Durable Object 沙箱 |
+| `packages/codemode/src/source.ts`、`wasm.ts` | 脚本源码与 WASM 支持 |
+| `packages/mcp/src/client.ts` | MCP 客户端 |
+| `packages/mcp/src/transports/` | stdio / Streamable HTTP / in-memory 传输 |
+| `packages/mcp/src/oauth/` | OAuth 授权（动态客户端注册、RFC 9207） |
+| `packages/env/src/remote-env.ts` | 远程 ExecutionEnv 客户端 |
+| `packages/env/src/connection.ts` | SSH 连接与守护进程部署 |
+| `packages/chord/src/api.ts` | 组合运行时 API（服务、复制状态、RPC） |
+| `packages/chord/src/delta/` | 不可变 delta 引擎（operation log） |
+| `packages/chord/src/facets/`、`services/` | facet 与服务组合 |
+| `packages/chord/src/node/bundle.ts` | 插件打包（esbuild） |
 
 ### Telemetry (遥测)
 
@@ -1000,25 +1003,6 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/telemetry/src/index.ts` | 遥测公共导出 |
 | `packages/telemetry/src/memory.ts` | 内存遥测实现 |
 | `packages/telemetry/src/noop.ts` | noop 遥测实现 |
-
-### Session Backends (SQLite Node)
-
-| 文件 | 职责 |
-|------|------|
-| `packages/session-backends/sqlite-node/src/index.ts` | Node sqlite 适配器与后端导出 |
-| `packages/session-backends/sqlite-node/src/sqlite/repo.ts` | `SqliteSessionRepo`：create/open/list/delete/fork |
-| `packages/session-backends/sqlite-node/src/sqlite/storage/entries.ts` | 会话条目编码/解码 |
-| `packages/session-backends/sqlite-node/src/sqlite/storage/lanes.ts` | 泳道状态存储 |
-| `packages/session-backends/sqlite-node/src/sqlite/storage/facts.ts` | 事实存储 |
-| `packages/session-backends/sqlite-node/src/sqlite/storage/records.ts` | 操作日志存储 |
-| `packages/session-backends/sqlite-node/src/sqlite/storage/branch-entries.ts` | 分支路径物化 |
-| `packages/session-backends/sqlite-node/src/sqlite/storage/branch-tips.ts` | 分支尖端物化 |
-| `packages/session-backends/sqlite-node/src/sqlite/storage/session-sequences.ts` | 序列号存储 |
-| `packages/session-backends/sqlite-node/src/sqlite/storage/session-stats.ts` | 会话统计 |
-| `packages/session-backends/sqlite-node/src/sqlite/migrations/` | 数据库迁移（001_initial.sql） |
-| `packages/session-backends/sqlite-node/src/sqlite/branch-cache.ts` | 分支缓存 |
-| `packages/session-backends/sqlite-node/src/sqlite/search-backend.ts` | 搜索后端 |
-| `packages/session-backends/sqlite-node/src/sqlite/sql.ts` | SQL 工具 |
 
 ### Evals
 
@@ -1039,16 +1023,16 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 
 Pi 的架构呈现清晰的纵向分层：
 
-1. **入口层**（CLI / Server / Bun 二进制）负责启动和外部连接。
-2. **应用层**（`coding-agent`）承载产品级语义：会话、扩展、工具、配置、UI、Skills、导出、模型解析、信任与认证。
-3. **运行时层**（`agent-core`）提供与产品无关的 Agent 循环、状态、压缩、可插拔存储与执行环境抽象，并内置 read/bash/edit/write 等通用工具实现。
-4. **LLM 层**（`ai`）将多提供商差异收敛为统一的消息/事件/认证模型，支持图像生成与多种 OAuth 流程。
-5. **UI 层**（`tui`）提供高效差分渲染的终端组件系统，支持图片、原生修饰键、自动补全等编辑器增强。
-6. **线协议/客户端层**（`protocol`/`client`）为远程会话提供二进制消息协议与传输无关的客户端；**遥测层**（`telemetry`）提供可插拔观测。
-7. **持久化层**（`session-backends/sqlite-node`，自 `storage/sqlite-node` 迁移）提供可选的 SQLite 后端实现（entries/lanes/facts/records）。
+1. **入口层**（CLI / Bun 二进制）负责启动和外部连接。
+2. **应用层**（`coding-agent`）承载产品级语义：会话、扩展、工具、配置、UI、Skills、导出、模型解析、信任与认证；能力面通过 `codemode`（沙箱脚本）与 `mcp`（MCP 服务器）扩展。
+3. **运行时层**（`agent-core`）提供与产品无关的 Agent 多轮循环与状态管理（持久化与 harness 已移出）。
+4. **持久运行时层**（`durable`，实验性）承载"先落盘再展示"的会话/文档/任务运行时，配套 `env`（SSH 远程执行）与 `chord`（文档状态、组合运行时）。
+5. **LLM 层**（`ai`）将多提供商差异收敛为统一的消息/事件/认证模型，支持图像生成与多种 OAuth 流程。
+6. **UI 层**（`tui`）提供高效差分渲染的终端组件系统（默认全屏布局），支持图片、原生修饰键、自动补全等编辑器增强。
+7. **线协议/客户端/服务器层**（`protocol`/`client`/`server`）为远程 durable Session 提供二进制消息协议、传输无关客户端与路由服务器；**遥测层**（`telemetry`）提供可插拔观测。
 8. **评测层**（`evals`）对 coding-agent 进行端到端行为评测。
 9. **示例扩展层**（`packages/coding-agent/examples/extensions/*`）展示如何扩展 Provider、UI 与沙箱。
 
-**Pi 2.0（AgentHarness v2）方向**：`packages/agent/docs/harness.md` 定义了持久化 Agent 运行时（entry tree + facts + lanes + usage ledger 四部分会话模型、三存储原子事务、效果三明治、崩溃恢复），配套 `protocol`/`client` 包支持远程会话接入，SQLite 后端迁移至 `session-backends`。这是与当前 `coding-agent` 并行的新一代架构。
+**实验性 durable 方向**：`pi-durable`（规范见 `packages/durable/docs/spec.md`）是新一代持久 Agent 运行时——事务会话/文档/任务、结构化并发（ownership、自底向上中止）、压缩与溢出、watch，存储后端 JSONL/SQLite（`node:sqlite` 与 Cloudflare Durable Object 适配器）；`coding-agent/src/experimental/` 已在其上实现 durable TUI、实验客户端/服务器与示例应用。主线 `coding-agent` 仍使用自身的 JSONL `SessionManager` 与 `AgentSession`。
 
 核心控制流是：用户输入 → `AgentSession.prompt()` → `Agent` 循环 → `Models.stream()` → 上游 LLM → 流式事件 → 工具执行 → 事件持久化 → UI/stdout 渲染。扩展和钩子机制贯穿整个流程，允许在输入、LLM 请求、工具调用、输出渲染等节点注入自定义行为。
