@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -318,6 +319,7 @@ describe("read of images, with the Photon image processor", () => {
 		]);
 	});
 
+	// Multiple full-image encodes can exceed Vitest's 5s default on shared CI runners.
 	it("re-encodes a PNG too large for the byte limit as JPEG at its size, and shrinks it when that is not enough", async () => {
 		const result = await read("big.png", noisyPng(1100, 1100), { images: processor });
 		const jpeg = onlyImage(result);
@@ -330,7 +332,7 @@ describe("read of images, with the Photon image processor", () => {
 		expect(shrunk!.data.length).toBeLessThanOrEqual(tight.maxBytes);
 		expect(shrunk!.resized?.from).toEqual({ width: 2000, height: 2000 });
 		expect(shrunk!.resized!.to.width).toBeLessThan(2000);
-	});
+	}, 60_000);
 
 	it("keeps at least one pixel on each side of an extreme aspect ratio", async () => {
 		const result = await processor.prepare(encode(6000, 2, "png"), "image/png", DEFAULT_IMAGE_LIMITS);
@@ -485,10 +487,24 @@ describe("imageDimensions", () => {
 
 describe("toBase64", () => {
 	it("matches Buffer for every remainder length", () => {
-		for (const length of [0, 1, 2, 3, 4, 5, 10_000]) {
+		for (const length of [0, 1, 2, 3, 4, 5, 8191, 8192, 8193, 10_000, 16_385]) {
 			const bytes = Uint8Array.from({ length }, (_, index) => (index * 37) % 256);
 			expect(toBase64(bytes)).toBe(Buffer.from(bytes).toString("base64"));
 		}
+	});
+
+	// #10923: building the output a character at a time took 138 MB of heap for a 3 MiB image.
+	it("encodes a 3 MiB image within a 128 MB heap", () => {
+		const source = new URL("../src/tools/image-processor.ts", import.meta.url).href;
+		const script = `
+			const { toBase64 } = await import(${JSON.stringify(source)});
+			const bytes = Uint8Array.from({ length: 3147295 }, (_, index) => (index * 37) % 256);
+			if (toBase64(bytes) !== Buffer.from(bytes).toString("base64")) throw new Error("mismatch");
+		`;
+		const args = ["--experimental-strip-types", "--max-heap-size=128", "--input-type=module", "-e", script];
+		const result = spawnSync(process.execPath, args, { encoding: "utf8" });
+		expect(result.stderr).not.toMatch(/heap out of memory|mismatch/);
+		expect(result.status).toBe(0);
 	});
 });
 

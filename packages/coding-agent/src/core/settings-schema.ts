@@ -1,5 +1,5 @@
-import { ModelThinkingLevelSchema } from "@earendil-works/pi-ai/providers/model-schema";
 import { type Static, type TSchemaOptions, Type } from "typebox";
+import { ModelThinkingLevelSchema } from "./pi-ai-schemas.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 
 function nonNegativeSafeInteger(options: { default?: number } = {}) {
@@ -207,6 +207,11 @@ export const SettingsSchema = Type.Object(
 	{
 		$schema: Type.Optional(Type.String({ description: "JSON Schema reference." })),
 		lastChangelogVersion: Type.Optional(Type.String()),
+		extensionChangelogVersions: Type.Optional(
+			Type.Record(Type.String(), Type.String(), {
+				description: "Last seen changelog version per extension package.",
+			}),
+		),
 		defaultProvider: Type.Optional(Type.String()),
 		defaultModel: Type.Optional(Type.String()),
 		defaultThinkingLevel: Type.Optional(ModelThinkingLevelSchema),
@@ -220,6 +225,13 @@ export const SettingsSchema = Type.Object(
 				[Type.Literal("auto"), Type.Literal("sse"), Type.Literal("websocket"), Type.Literal("websocket-cached")],
 				{ default: SETTINGS_DEFAULTS.transport },
 			),
+		),
+		sessionShareDestination: Type.Optional(
+			Type.Union([Type.Literal("auto"), Type.Literal("gist"), Type.Literal("radius")], {
+				description:
+					'Destination used by /share. "auto" uses Radius when authenticated and otherwise creates a GitHub gist.',
+				default: SETTINGS_DEFAULTS.sessionShareDestination,
+			}),
 		),
 		steeringMode: Type.Optional(
 			Type.Union([Type.Literal("all"), Type.Literal("one-at-a-time")], {
@@ -269,6 +281,13 @@ export const SettingsSchema = Type.Object(
 			Type.Array(Type.String(), {
 				description:
 					'Command used for npm package lookup and installation, in argv form such as ["mise", "exec", "node@20", "--", "npm"].',
+			}),
+		),
+		selfUpdateCommand: Type.Optional(
+			Type.Array(Type.String(), {
+				minItems: 1,
+				description:
+					'Command `pi update` runs to update Pi itself, in argv form such as ["mise", "use", "-g", "npm:{packageName}@{version}"]. Placeholders: {packageName}, {version}, {installSpec}. PI_SELF_UPDATE_COMMAND takes precedence. Global setting only.',
 			}),
 		),
 		collapseChangelog: Type.Optional(
@@ -464,6 +483,7 @@ export interface CodemodeSettings extends Static<typeof CodemodeSettingsSchema> 
 export type DefaultProjectTrust = NonNullable<SettingsInput["defaultProjectTrust"]>;
 export type QuietStartup = NonNullable<SettingsInput["quietStartup"]>;
 export type TransportSetting = NonNullable<SettingsInput["transport"]>;
+export type SessionShareDestination = NonNullable<SettingsInput["sessionShareDestination"]>;
 export type PackageSource = Static<typeof PackageSourceSchema>;
 export type FullscreenExitOutput = NonNullable<SettingsInput["fullscreenExitOutput"]>;
 export type TuiMode = NonNullable<SettingsInput["tuiMode"]>;

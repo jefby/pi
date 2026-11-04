@@ -18,7 +18,10 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
 import type { CustomEntry } from "../../src/core/session-manager.ts";
-import { createToolDefinitionFromAgentTool } from "../../src/core/tools/tool-definition-wrapper.ts";
+import {
+	createToolDefinitionFromAgentTool,
+	type TypeBoxAgentTool,
+} from "../../src/core/tools/tool-definition-wrapper.ts";
 import { readCodemodeStore } from "../../src/extensions/codemode/execute.ts";
 import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import {
@@ -33,7 +36,7 @@ const TINY_PNG_BASE64 =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
 
 const echoSchema = Type.Object({ text: Type.String({ description: "Text to echo" }) });
-const echoTool: AgentTool<typeof echoSchema> = {
+const echoTool: TypeBoxAgentTool<typeof echoSchema> = {
 	name: "echo",
 	label: "Echo",
 	description: "Echo text back.\n\nSecond paragraph.",
@@ -182,6 +185,49 @@ describe("AgentSession codemode tool", () => {
 		// Without codemode, tools keep their plain descriptions.
 		harness.session.setActiveToolsByName(["echo"]);
 		expect(description("echo")).toBe("Echo text back.\n\nSecond paragraph.");
+	});
+
+	// #11501
+	it("summarizes union and multi-line output types instead of inlining them", async () => {
+		const outputTool = (name: string, outputSchema: AgentTool["outputSchema"]): AgentTool => ({
+			name,
+			label: name,
+			description: `${name} tool`,
+			parameters: Type.Object({}),
+			outputSchema,
+			execute: async () => ({ content: [], details: {} }),
+		});
+		const process = outputTool(
+			"process",
+			Type.Union([
+				Type.Object({
+					action: Type.Literal("start"),
+					process: Type.Object({ id: Type.String({ description: "Process id" }), pid: Type.Integer() }),
+				}),
+				Type.Object({
+					action: Type.Literal("list"),
+					processes: Type.Array(Type.Object({ id: Type.String() })),
+					truncated: Type.Optional(Type.Boolean()),
+				}),
+			]),
+		);
+		const entries = outputTool("entries", Type.Array(Type.Object({ id: Type.String(), size: Type.Integer() })));
+		const count = outputTool("count", Type.Number());
+		const harness = await setup([
+			(pi: ExtensionAPI) => {
+				for (const tool of [process, entries, count]) pi.registerTool(createToolDefinitionFromAgentTool(tool));
+			},
+		]);
+		harness.session.setActiveToolsByName(["process", "entries", "count", "codemode"]);
+		const description = (name: string) =>
+			harness.session.agent.state.tools.find((tool) => tool.name === name)?.description ?? "";
+		expect(description("process")).toBe(
+			'process tool\n\nCodemode: `tools.process(args)` resolves to `{ action: "start", process } | { action: "list", processes, truncated? }`.',
+		);
+		expect(description("entries")).toBe(
+			'entries tool\n\nCodemode: `tools.entries(args)` resolves to a value; `await describeTool("entries")` shows its type.',
+		);
+		expect(description("count")).toBe("count tool\n\nCodemode: `tools.count(args)` resolves to `number`.");
 	});
 
 	// #10343
@@ -495,6 +541,16 @@ describe("codemode options and store", () => {
 				text: "@options only supports `max_output_tokens` and `timeout_ms`; got `yield`",
 			},
 		]);
+
+		// #10631: a misplaced options line fails before the script runs instead of running without a deadline.
+		const misplaced = await run(harness, '// count\n// @options: {"timeout_ms": 200}\nwhile (true) {}');
+		expect(misplaced.isError).toBe(true);
+		expect(misplaced.content).toEqual([
+			{
+				type: "text",
+				text: "The // @options: line must be the first line of the input; found one on line 2",
+			},
+		]);
 	});
 
 	it("limits script memory so runaway allocations fail inside the script", async () => {
@@ -539,6 +595,18 @@ describe("codemode options and store", () => {
 
 		const small = await run(harness, "return { ok: true };");
 		expect((small.details as unknown as CodemodeToolDetails).fullOutputPath).toBeUndefined();
+	});
+
+	// #10678: joining the text items was quadratic, about 10 s here for the item limit.
+	it("formats output at the item limit in linear time", async () => {
+		const harness = await setup();
+		const startedAt = performance.now();
+		const result = await run(harness, 'for (let i = 0; i < 100000; i++) text("");');
+		const elapsed = performance.now() - startedAt;
+		rmSync((result.details as unknown as CodemodeToolDetails).fullOutputPath ?? "", { force: true });
+		expect(result.isError).toBe(false);
+		expect(resultText(result)).toContain("==> text 100000/100000 <==");
+		expect(elapsed).toBeLessThan(5000);
 	});
 
 	it("resolves bash calls to structured results, also for non-zero exit codes", async () => {
@@ -928,6 +996,24 @@ describe("codemode models", () => {
 					models.classify(model, { state: {}, questions: { kind: { type: "choice", instructions: "Kind?", criteria: ["a", "b"] } } }),
 				),
 				badImage: await attempt(() => models.generateImages({ provider: "scorer", id: "painter" }, { prompt: "a fox" })),
+				arrayModel: await attempt(() => models.classify(["scorer", "judge"], {})),
+				arrayContext: await attempt(() => models.classify(model, [])),
+				arrayState: await attempt(() => models.classify(model, { state: [], questions: ${questions} })),
+				arrayQuestions: await attempt(() => models.classify(model, { state: {}, questions: [] })),
+				arrayQuestion: await attempt(() => models.classify(model, { state: {}, questions: { kind: [] } })),
+				noInstructions: await attempt(() =>
+					models.classify(model, { state: {}, questions: { kind: { type: "bool", criteria: { true: "y", false: "n" } } } }),
+				),
+				badBool: await attempt(() =>
+					models.classify(model, { state: {}, questions: { kind: { type: "bool", instructions: "Ok?", criteria: ["y", "n"] } } }),
+				),
+				badKind: await attempt(() =>
+					models.classify(model, { state: {}, questions: { kind: { type: "rank", instructions: "Rank?" } } }),
+				),
+				arrayImagesContext: await attempt(() => models.generateImages({ provider: "scorer", id: "painter" }, [])),
+				badImageBlock: await attempt(() =>
+					models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }, { type: "image", data: "aW1hZ2U=" }] }),
+				),
 				badSplit: await attempt(() => models.getModelOfType("classifier", "scorer/judge")),
 			};
 		`,
@@ -958,6 +1044,30 @@ describe("codemode models", () => {
 			"models.generateImages() context.input must be a non-empty array of blocks, got undefined.",
 		);
 		expect(value.badSplit).toContain("The provider and the id are separate arguments");
+		expect(value.arrayModel).toContain(
+			"models.classify() expects a classifier model as its first argument, got an array.",
+		);
+		expect(value.arrayContext).toContain(
+			"models.classify() expects a context object as its second argument, got an empty array.",
+		);
+		expect(value.arrayState).toContain("models.classify() context.state must be an object, got an empty array.");
+		expect(value.arrayQuestions).toContain(
+			"models.classify() context.questions must map question IDs to questions, got an empty array.",
+		);
+		expect(value.arrayQuestion).toContain(
+			"models.classify() context.questions.kind must be a question object, got an empty array.",
+		);
+		expect(value.noInstructions).toContain("models.classify() context.questions.kind.instructions must be a string.");
+		expect(value.badBool).toContain(
+			'context.questions.kind is a "bool" question, so criteria must be { true: string, false: string }.',
+		);
+		expect(value.badKind).toContain('context.questions.kind.type must be "choice", "score", or "bool", got "rank".');
+		expect(value.arrayImagesContext).toContain(
+			"models.generateImages() expects a context object as its second argument, got an empty array.",
+		);
+		expect(value.badImageBlock).toContain(
+			"models.generateImages() context.input[1] must be a text or image block, got { type, data }.",
+		);
 		const details = result.details as unknown as CodemodeToolDetails;
 		expect(details.calls.map((call) => [call.name, call.status, call.error])).toEqual([
 			["models.classify", "error", "classifier exploded"],

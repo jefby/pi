@@ -25,6 +25,7 @@ import {
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
+	getOpenCodeSessionHeaders,
 	type ImageApi,
 	type ImageModel,
 	type ImagesContext,
@@ -57,6 +58,7 @@ import {
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
+import { personalizeOpenRouterCatalog } from "@earendil-works/pi-ai/providers/openrouter";
 import {
 	assertChatModel,
 	assertClassifierInputSupported,
@@ -80,7 +82,7 @@ import {
 	resolveConfiguredModelHeaders,
 	validateExtensionProvider,
 } from "./provider-composer.ts";
-import { withRemoteCatalog } from "./remote-catalog-provider.ts";
+import { withPersonalizedCatalog, withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
 import {
 	createVirtualModel,
@@ -224,13 +226,19 @@ export class ModelRuntime implements Models {
 				? new FileModelsStore(options.modelsStorePath ?? join(dirname(modelsPath), "models-store.json"))
 				: new InMemoryCodingAgentModelsStore());
 		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
-		const providers = builtinProviderCatalog
-			.builtinProviders()
-			.map((provider) =>
-				provider.id === "radius"
-					? provider
-					: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
-			);
+		const providers = builtinProviderCatalog.builtinProviders().map((provider) => {
+			if (provider.id === "radius") return provider;
+			// OpenRouter narrows the catalog to the models, limits and prices of the user's key.
+			if (provider.id === "openrouter") {
+				return withPersonalizedCatalog(
+					provider,
+					personalizeOpenRouterCatalog,
+					options.catalogBaseUrl,
+					builtinModelDataGeneratedAt,
+				);
+			}
+			return withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt);
+		});
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
@@ -670,13 +678,20 @@ export class ModelRuntime implements Models {
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
 		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
-		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
+		const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
+		const sessionId =
+			"sessionId" in providerOptions && typeof providerOptions.sessionId === "string"
+				? providerOptions.sessionId
+				: undefined;
+		let headers = mergeHeaders(
+			mergeHeaders(getOpenCodeSessionHeaders(requestModel, sessionId), resolution.auth.headers),
+			providerOptions.headers,
+		);
 		if (transformHeaders) headers = await transformHeaders(headers ?? {});
 		const env =
 			resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
 				: undefined;
-		const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
 		return {
 			provider,
 			model: requestModel,
@@ -695,14 +710,19 @@ export class ModelRuntime implements Models {
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
-		return lazyStream(model, async () => {
-			assertChatModel(model);
-			const prepared = await this.prepareRequest(
-				model,
-				options as (StreamOptions & ModelsRequestTransforms) | undefined,
-			);
-			return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
-		});
+		return lazyStream(
+			model,
+			async () => {
+				assertChatModel(model);
+				const prepared = await this.prepareRequest(
+					model,
+					options as (StreamOptions & ModelsRequestTransforms) | undefined,
+				);
+				return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
+			},
+			undefined,
+			options?.signal,
+		);
 	}
 
 	complete<TApi extends Api>(
@@ -718,27 +738,38 @@ export class ModelRuntime implements Models {
 		if (isVirtualModel(model)) {
 			// Requests outside the agent loop are routed here. Callers sized them before routing, so
 			// cap the output budget to the routed model.
-			return lazyStream(model, async () => {
-				const route = await this.resolveModel(model, transcript.messages, {
-					reason: "direct",
-					thinkingLevel: options?.reasoning ?? "off",
-					signal: options?.signal,
-				});
-				const { maxTokens: limit } = route.model;
-				const maxTokens = options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
-				const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
-				// Caller credentials were resolved for the virtual model's provider. Another provider
-				// resolves its own, so they are not sent to the wrong vendor.
-				const { apiKey, headers, env, ...rest } = options ?? {};
-				const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
-				return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
-			});
+			return lazyStream(
+				model,
+				async () => {
+					const route = await this.resolveModel(model, transcript.messages, {
+						reason: "direct",
+						thinkingLevel: options?.reasoning ?? "off",
+						signal: options?.signal,
+					});
+					const { maxTokens: limit } = route.model;
+					const maxTokens =
+						options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
+					const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
+					// Caller credentials were resolved for the virtual model's provider. Another provider
+					// resolves its own, so they are not sent to the wrong vendor.
+					const { apiKey, headers, env, ...rest } = options ?? {};
+					const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
+					return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
+				},
+				undefined,
+				options?.signal,
+			);
 		}
-		return lazyStream(model, async () => {
-			assertChatModel(model);
-			const prepared = await this.prepareRequest(model, options);
-			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
-		});
+		return lazyStream(
+			model,
+			async () => {
+				assertChatModel(model);
+				const prepared = await this.prepareRequest(model, options);
+				return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
+			},
+			undefined,
+			options?.signal,
+		);
 	}
 
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {
@@ -750,14 +781,19 @@ export class ModelRuntime implements Models {
 		handle: DeferredHandle,
 		options?: ModelsDeferredFetchOptions,
 	): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			assertChatModel(model);
-			const prepared = await this.prepareRequest(model, options);
-			if (!prepared.provider.fetchDeferred) {
-				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
-			}
-			return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
-		});
+		return lazyStream(
+			model,
+			async () => {
+				assertChatModel(model);
+				const prepared = await this.prepareRequest(model, options);
+				if (!prepared.provider.fetchDeferred) {
+					throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+				}
+				return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
+			},
+			undefined,
+			options?.signal,
+		);
 	}
 
 	async fetchDeferred(
