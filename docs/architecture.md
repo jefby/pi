@@ -1,6 +1,6 @@
 # Pi 软件流程架构分析
 
-> 分析范围：Pi monorepo 核心工作区（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/durable`、`packages/codemode`、`packages/mcp`、`packages/server`、`packages/client`、`packages/protocol`、`packages/telemetry`、`packages/env`、`packages/chord`、`packages/evals`）以及若干示例扩展工作区，重点描述它们之间的调用与数据流。核对至上游 `e6b9a6af5`（v1.1.0 之后，2026-10-11）。
+> 分析范围：Pi monorepo 十二个工作区（`packages/coding-agent`、`packages/agent`、`packages/ai`、`packages/tui`、`packages/schema`、`packages/durable`、`packages/codemode`、`packages/mcp`、`packages/env`、`packages/chord`、`packages/telemetry`、`packages/evals`）以及若干示例扩展工作区，重点描述它们之间的调用与数据流。核对至上游 `e88525506`（v1.5.0，2026-11-02）。
 
 ## 目录
 
@@ -21,7 +21,7 @@
   - [4.8 会话存储抽象](#48-会话存储抽象)
   - [4.9 Skills、提示模板与扩展系统](#49-skills-提示模板与扩展系统)
   - [4.10 HTML 会话导出](#410-html-会话导出)
-- [5. Server：durable Session 路由（实验性）](#5-serverdurable-session-路由实验性)
+- [5. pi-schema 与工具参数校验](#5-pi-schema-与工具参数校验)
 - [6. Evals 评测框架](#6-evals-评测框架)
 - [7. 数据持久化](#7-数据持久化)
 - [8. 关键文件索引](#8-关键文件索引)
@@ -32,40 +32,40 @@
 
 Pi 是一个模块化、分层设计的 AI 编程助手运行时：
 
-- **`packages/server`**：实验性的本地路由服务器，把外部客户端路由到应用托管的 durable Session：应用实现 `SessionDirectory`（会话目录投影）与 `SessionManagement`（创建/删除/挂载），服务器按 `{serverId, sessionId, attachmentId}` 校验附件路由，`invokeService()` 不解码业务负载，支持一个会话多个呈现附件。通过 `pi-server/unix` 提供 Unix Domain Socket 传输。纯库、无 CLI，`coding-agent` 仅在实验代码（devDependencies）中使用。
-- **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）、Skills、HTML 导出。内置工具之外通过 `pi-codemode`（quickjs 沙箱脚本工具）与 `pi-mcp`（MCP 服务器客户端）扩展；`src/experimental/` 提供 durable TUI、实验客户端/服务器与 Radius 中继（`PI_EXPERIMENTAL=1` 启用）。
-- **`packages/agent`**：通用 Agent 运行时，提供多轮对话循环、消息队列（steer/followUp）、工具调度、状态管理。原实验性 harness（会话树/存储抽象/搜索）已迁出至 `pi-durable`，本包现仅保留核心循环。
-- **`packages/durable`**：实验性持久 Agent 运行时——会话、模型轮次、工具调用与应用状态先提交存储再展示，进程中途崩溃后重开存储可从断点继续。包含事务会话（fork/checkpoint/migration）、任务运行时（结构化并发、ownership、inbox/submissions、task graph）、压缩与溢出、watch、图像（Photon worker 线程）；存储后端 JSONL / SQLite（`node:sqlite` 与 Cloudflare Durable Object 适配器）/ memory。文档状态基于 `chord`。规范见 `packages/durable/docs/spec.md`。
-- **`packages/codemode`**：沙箱化 JavaScript 执行——脚本唯一的能力是调用注入的工具（quickjs-wasi 运行时）；支持经 Cloudflare Workers 远程 Durable Object 运行沙箱。
-- **`packages/mcp`**：独立 Model Context Protocol 客户端（stdio / Streamable HTTP 传输、OAuth 授权与动态客户端注册），供 pi 与其他应用复用。
-- **`packages/env`**：pi-durable 的远程执行环境——一个通过 SSH 部署的小型守护进程及其 ExecutionEnv 客户端。
-- **`packages/ai`**：统一多提供商 LLM API，封装 OpenAI、Anthropic、Google、Bedrock、Mistral 等协议。
-- **`packages/tui`**：终端 UI 库，提供差分渲染、组件树、键盘输入、编辑器和覆盖层，默认全屏布局。
-- **`packages/chord`**：应用组合运行时——服务、复制状态、RPC、facets、插件；pi-durable 的文档状态与 delta 引擎基于它，`chord/node` 提供插件打包（依赖 esbuild）。
-- **`packages/protocol`**：运行时无关的线协议包——schema、类型、CBOR 编解码、字节流 framing，用于客户端与服务器之间的二进制消息。
-- **`packages/client`**：传输无关的远程会话客户端（`PiClient`），通过 `ByteTransport` 交换长度前缀 CBOR 消息（依赖 `chord` 的复制状态）。
-- **`packages/telemetry`**：遥测包，提供内存/noop 实现，供运行时观察与追踪。
+- **`packages/coding-agent`**：主 CLI/SDK，负责参数解析、会话管理、扩展加载、内置工具、运行模式（交互式/一次性/RPC）、Skills、HTML 导出。内置工具为 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`、`powershell`；通过内置扩展接入 `pi-codemode`（quickjs 沙箱脚本工具）、`pi-mcp`（MCP 服务器客户端）、工具搜索与 llama.cpp。不依赖 `chord`/`durable`/`env`，运行时依赖树只到 `pi-agent-core`、`pi-ai`、`pi-codemode`、`pi-mcp`、`pi-tui`。
+- **`packages/agent`**（`pi-agent-core`）：通用 Agent 运行时——多轮对话循环、消息队列（steer/followUp）、工具调度、状态管理；工具参数类型与校验基于 `pi-schema`。实验性 harness 已于 v1.1 前后迁出至 `pi-durable`。
+- **`packages/ai`**（`pi-ai`）：统一多提供商 LLM API，封装 OpenAI、Anthropic、Google、Bedrock、Mistral 等协议；配置契约（模型兼容性、费用、输入限制）用 `pi-schema` 描述。
+- **`packages/tui`**（`pi-tui`）：终端 UI 库，提供差分渲染、组件树、键盘输入、编辑器和覆盖层，默认全屏布局。
+- **`packages/schema`**（`pi-schema`）：不依赖 `eval` 的 JSON Schema 校验器，支持 draft 2020-12 与 draft 7，把 schema 编译为普通闭包；提供 builder（`obj`/`num` 等）、强制转换与 `Static` 类型工具。它是工具参数校验与配置契约的共用基础，零运行时依赖。
+- **`packages/durable`**（`pi-durable`，实验性）：持久 Agent 运行时——会话、模型轮次、工具调用与应用状态先提交存储再展示，进程中途崩溃后重开存储可从断点继续。包含事务会话（fork、`/tree` 分支、checkpoint）、任务运行时（结构化并发、ownership、inbox/submissions、task graph）、压缩与溢出、watch、图像（Photon worker 线程）、codemode/tool-search 集成；存储后端 JSONL / SQLite（`node:sqlite` 与 Cloudflare Durable Object）/ IndexedDB / store / memory。文档状态基于 `chord`。规范见 `packages/durable/docs/spec.md`。
+- **`packages/codemode`**（`pi-codemode`）：沙箱化 JavaScript 执行——脚本唯一的能力是调用注入的工具（quickjs-wasi 运行时）；支持经 Cloudflare Workers 远程 Durable Object 运行沙箱。
+- **`packages/mcp`**（`pi-mcp`）：独立 Model Context Protocol 客户端（stdio / Streamable HTTP 传输、OAuth 授权与动态客户端注册），供 pi 与其他应用复用。
+- **`packages/env`**（`pi-env`）：pi-durable 的远程执行环境——一个通过 SSH 部署的小型 Rust 守护进程及其 ExecutionEnv 客户端。
+- **`packages/chord`**（`@earendil-works/chord`）：跨进程对象运行时——契约、文档、store、链接、插件热重载、HTTP、workers、Web 与终端 surface。契约用 `pi-schema` 的 builder 描述；插件构建（`chord/plugins`）使用可选 peer 依赖 `esbuild`，其余入口不加载它。pi-durable 的文档状态基于它。
+- **`packages/telemetry`**（`pi-telemetry`）：厂商中立的遥测契约——span、属性、传播载体（propagation）、指标定义、内存与 noop 实现、渲染与测试辅助。
 - **`packages/evals`**：内部行为评测包，基于 `vitest-evals` 对 coding-agent 进行端到端评测。
+
+注：v1.2.0 移除了实验性的 `packages/server`、`packages/client`、`packages/protocol` 及 `coding-agent/src/experimental` 的客户端/服务器栈；v1.5.0 新增 `packages/schema`。
 
 整体数据流向：
 
 ```mermaid
 flowchart LR
-    User[用户/外部客户端]
+    User[用户]
     CodingAgent[pi-coding-agent]
-    Agent[Agent 运行时]
+    Agent[pi-agent-core 运行时]
     AI[pi-ai 提供商层]
     LLM[上游 LLM API]
     TUI[pi-tui 终端 UI]
     Tools[文件/Shell 工具]
+    Schema[pi-schema<br/>工具参数校验]
     Codemode[pi-codemode<br/>quickjs 沙箱]
     MCP[pi-mcp<br/>MCP 服务器]
     Durable[pi-durable<br/>实验性持久运行时]
-    Chord[pi-chord<br/>组合运行时]
+    Env[pi-env<br/>SSH 远程执行]
+    Chord[chord<br/>对象运行时]
+    Telemetry[pi-telemetry<br/>span/指标契约]
     Evals[pi-evals]
-    Client[pi-client 远程客户端]
-    Protocol[pi-protocol 线协议]
-    Server[pi-server<br/>durable Session 路由]
 
     User -->|cli / rpc| CodingAgent
     CodingAgent -->|"new Agent()"| Agent
@@ -77,12 +77,16 @@ flowchart LR
     CodingAgent -->|render| TUI
     CodingAgent -->|execute| Tools
     CodingAgent -->|注入工具| Codemode & MCP
-    CodingAgent -.->|PI_EXPERIMENTAL=1| Durable
-    Durable -->|文档状态| Chord
-    Client -->|CBOR 消息| Protocol
-    Protocol -->|durable Session 路由| Server
-    Server -->|host harness| Durable
-    CodingAgent -.->|devDep| Client
+    Agent -->|校验参数| Schema
+    AI -->|配置契约| Schema
+    Durable --> AI
+    Durable --> Chord
+    Durable --> Schema
+    Durable --> Codemode
+    Env --> Durable
+    Chord --> Schema
+    Chord --> Telemetry
+    Durable --> Telemetry
     Evals -->|harness| CodingAgent
 ```
 
@@ -100,22 +104,25 @@ flowchart TB
         CodingAgent["@earendil-works/pi-coding-agent"]
     end
 
-    subgraph Layer5b["能力扩展层"]
+    subgraph Layer5c["能力扩展层"]
         Codemode["@earendil-works/pi-codemode"]
         MCP["@earendil-works/pi-mcp"]
     end
 
+    subgraph Layer5b["持久运行时层（实验性）"]
+        Durable["@earendil-works/pi-durable"]
+        Env["@earendil-works/pi-env"]
+    end
+
     subgraph Layer5["Agent 运行时层"]
         AgentCore["@earendil-works/pi-agent-core"]
-        Durable["@earendil-works/pi-durable（实验性）"]
-        Env["@earendil-works/pi-env"]
     end
 
     subgraph Layer4["LLM 抽象层"]
         AI["@earendil-works/pi-ai"]
     end
 
-    subgraph Layer3b["组合运行时层"]
+    subgraph Layer3b["对象运行时层"]
         Chord["@earendil-works/chord"]
     end
 
@@ -123,10 +130,8 @@ flowchart TB
         TUI["@earendil-works/pi-tui"]
     end
 
-    subgraph Layer2["线协议/客户端层"]
-        Protocol["@earendil-works/pi-protocol"]
-        Client["@earendil-works/pi-client"]
-        Server["@earendil-works/pi-server"]
+    subgraph Layer2["契约层"]
+        Schema["@earendil-works/pi-schema"]
         Telemetry["@earendil-works/pi-telemetry"]
     end
 
@@ -140,17 +145,18 @@ flowchart TB
     CodingAgent --> TUI
     CodingAgent --> Codemode
     CodingAgent --> MCP
-    CodingAgent -.->|experimental| Durable
     AgentCore --> AI
+    AgentCore --> Schema
+    AI --> Schema
     Durable --> AI
     Durable --> Chord
+    Durable --> Codemode
+    Durable --> Schema
     Env --> Durable
-    Client --> Protocol
-    Client -.-> Chord
-    Server --> Protocol
-    Server --> Chord
-    CodingAgent -.->|devDep| Client & Server
-    AgentCore -.->|telemetry| Telemetry
+    Chord --> Schema
+    Chord --> Telemetry
+    Durable --> Telemetry
+    TUI --> Schema
     Evals -->|harness| CodingAgent
     Examples -.->|extends| CodingAgent
 ```
@@ -161,16 +167,14 @@ flowchart TB
 | 应用/SDK | `pi-coding-agent` | 会话管理、扩展、内置工具、模式实现、配置、Skills、导出、模型解析、OAuth、codemode/MCP 集成 |
 | 能力扩展 | `pi-codemode` | quickjs-wasi 沙箱脚本执行（唯一能力是调用注入工具）、Cloudflare Workers 沙箱 |
 | 能力扩展 | `pi-mcp` | 独立 MCP 客户端（传输、OAuth、工具暴露） |
-| Agent 运行时 | `pi-agent-core` | 多轮循环、消息队列、工具调度（核心循环；持久化/harness 已移出） |
-| 持久运行时（实验性） | `pi-durable` | 事务会话/文档/任务、harness、调度、压缩、watch、图像、存储后端（JSONL/SQLite/Cloudflare DO/memory） |
-| 远程执行 | `pi-env` | SSH 部署的远程执行环境守护进程与 ExecutionEnv 客户端（配合 pi-durable） |
+| 持久运行时（实验性） | `pi-durable` | 事务会话/文档/任务、harness、调度、压缩、watch、图像、codemode/tool-search、存储后端 |
+| 远程执行 | `pi-env` | SSH 部署的 Rust 守护进程与 ExecutionEnv 客户端（配合 pi-durable） |
+| Agent 运行时 | `pi-agent-core` | 多轮循环、消息队列、工具调度、参数校验（核心循环，无持久化） |
 | LLM 抽象 | `pi-ai` | 多提供商注册、认证、流式请求、协议转换、模型目录、图像生成 |
-| 组合运行时 | `pi-chord` | 复制状态、RPC、facets/services、插件、delta 引擎、bundler |
+| 对象运行时 | `chord` | 契约、文档、store、链接、插件热重载、HTTP、workers、Web/TUI surface |
 | 终端 UI | `pi-tui` | 差分渲染、组件、输入、编辑器、覆盖层、图片、全屏布局 |
-| 线协议 | `pi-protocol` | schema/类型、CBOR 编解码、字节流 framing、消息校验 |
-| 客户端 | `pi-client` | 传输无关的远程客户端（PiClient） |
-| 服务器（实验性） | `pi-server` | durable Session 路由服务器（Unix socket、附件路由） |
-| 遥测 | `pi-telemetry` | 内存/noop 遥测实现，观测与追踪 |
+| 契约 | `pi-schema` | JSON Schema 校验（无 eval）、builder、强制转换、`Static` 类型 |
+| 契约 | `pi-telemetry` | span/属性/传播/指标契约、内存与 noop 实现、渲染 |
 | 评测 | `pi-evals` | 基于 `vitest-evals` 的端到端行为评测 |
 | 示例扩展 | `packages/coding-agent/examples/extensions/*` | 自定义 Provider、沙箱、GitLab Duo 等扩展示例 |
 
@@ -182,7 +186,7 @@ flowchart TB
 
 - **Node 入口**：`packages/coding-agent/src/cli.ts` → `dist/bundle/cli.js`（`bin "pi"`，esbuild 单文件 Node bundle）。
 - **Bun 二进制入口**：编译后的 `dist/pi` 同样进入 `cli.ts`。
-- **Server**：`packages/server` 现为纯库（无 CLI、无 bin），供实验代码宿主 durable Session 路由服务器。
+- **RPC 入口**：`packages/coding-agent/src/rpc-entry.ts`，供外部进程以 `--mode rpc` 驱动。
 - **Evals 入口**：`npm run eval -w packages/evals` 依次运行宿主机评测与文档对照评测；后者由 `packages/evals/src/cli.ts` 编排，通过 Docker 隔离运行。模型通过 `PI_PROVIDER` / `PI_MODEL` 指定。
 
 ### 3.2 运行模式
@@ -365,16 +369,18 @@ flowchart LR
 5. API 模块将归一化的 `Context` 转换为提供商特定请求体，创建 SDK 客户端，发起流式请求。
 6. 上游事件被解析为标准 `AssistantMessageEvent`：`start`、`text_delta`、`thinking_*`、`toolcall_*`、`done`、`error`。
 
-Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex、Bedrock、Azure OpenAI、Mistral、Cerebras、DeepSeek、Fireworks、Groq、Together、OpenRouter、GitHub Copilot、Cloudflare、Moonshot、Qwen、MiniMax、xAI、ZAI 等数十个 provider，每个 provider 通常包含 `index.ts` 与 `<name>.models.ts` 分别描述能力与模型列表。`images.ts` 与 `image-models.generated.ts` 提供统一的图像生成入口。部分 provider 有特殊行为：xAI 模型统一通过 Responses API 路由（默认 Grok 4.6）；Google 思考级别遵循官方级别映射；Kimi 追踪缓存 token 用量；ZAI 使用中文 Coding Plan 模型目录；废弃的 Xiaomi 模型已移除。
+Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex、Bedrock、Azure OpenAI、Mistral、Cerebras、DeepSeek、Fireworks、Groq、Together、OpenRouter、GitHub Copilot、Cloudflare、Moonshot、Qwen（含 Token Plan Individual CN）、MiniMax、xAI、ZAI 等数十个 provider，每个 provider 通常包含 `index.ts` 与 `<name>.models.ts` 分别描述能力与模型列表。`images.ts` 与 `image-models.generated.ts` 提供统一的图像生成入口。部分 provider 有特殊行为：xAI 模型统一通过 Responses API 路由；Google 思考级别遵循官方级别映射；Kimi 追踪缓存 token 用量；ZAI 使用中文 Coding Plan 模型目录。
 
-近期提供商兼容与重试行为（截至上游 `e6b9a6af5`，v1.1.0 后）：
+近期提供商兼容、schema 与重试行为（截至上游 `e88525506`，v1.5.0）：
 
-- **Google / Vertex 思考级别**：先由 `clampThinkingLevel()` 选择模型支持的级别，再按 `thinkingLevelMap` 映射；两条 API 共用 `google-shared.ts`。关闭思考时，支持关闭的模型使用 `thinkingBudget: 0`，不支持的模型使用最低支持级别。
-- **Anthropic 模型标识与工具**：`AssistantMessage.model` 保留请求模型 ID，服务端返回不同名称时另存 `responseModel`；对话中途新增的工具改为内联定义（不再仅靠首轮 system tools）。Claude Opus/Sonnet/Haiku 5.5 系列改用 models.dev 元数据。
-- **采样参数**：`per-thinking-level` 采样参数（#9776）按思考级别覆盖 temperature/top_p 等；Bedrock Converse 上向 OpenAI 模型发送 reasoning effort（#10142）。
-- **认证**：Anthropic 支持 workload identity federation（#10242）与 copy code 登录（#10194）；Azure 新增 Foundry Chat Completions 部署（#9714）；OpenAI 登录允许应用声明自身名称（#10433）；Radius 提供商目录与 `/login` Radius 登录；Meta（Muse 订阅 OAuth）。
-- **暂时性错误识别**：`utils/retry.ts` 将 Cloudflare HTTP 520、Azure 高峰容量、"Selected model is at capacity"、server-busy、Mistral finish_reason 错误纳入可重试；`Retry-After` 无法解析时退回指数退避；HTTP/2 挂起流取消可重试。
-- **分类器与图像**：OpenAI Decisions 分类器、Cloudflare Clef 分类器（Workers AI）、llama.cpp 分类器模型原生支持（#10382）；请求上下文按 3.5 字符/token 估算，各目录保留 prompt-length 分级计价。
+- **工具参数校验迁移到 `pi-schema`**（v1.5.0 破坏性变更）：`pi-ai` 主入口不再 re-export TypeBox，`typebox` 不再是依赖；`Tool.parameters` 接受任意 JSON Schema（pi-schema builder、TypeBox schema 或普通对象），`validateToolCall()` / `validateToolArguments()` 统一走 `compile(schema, { coerce: true }).parse()`。模型与 compat schema（`providers/model-schema`、`providers/compat-schema`）也由 pi-schema 构建，类型来自其 `Static`。详见第 5 节。
+- **流式工具参数**：新增增量、容错的 `StreamingJsonParser` 与 `ToolCallArgumentsStream`，所有 provider 用它解析分片的工具调用参数；`append()` 同时返回每片的变更（`JsonChange`），供增量渲染复用，大工具调用不再每次全量重解析。
+- **Anthropic 消息线程**：带 `sessionId` 且 `cacheRetention` 非 `"none"` 的请求使用 message threads beta（`message-threads-2026-08-12`）——服务端从上一轮回复续写，pi 只发新消息；历史变化或服务端无法续写时回退为完整请求。仅对 `api.anthropic.com` 的 `anthropic` provider 默认开启，可用 `compat.supportsMessageThreads` 覆盖；`StreamOptions.disableContinuation` 让缓存预热等重复请求不复用/替换续写状态。
+- **模型目录**：内置目录改由 models.dev v2 生成，per-provider 规则从 `scripts/generate-models.ts` 移入 `catalog/` 下每个 provider 的 TypeScript 定义；realtime/image 类模型不再作为聊天模型提供。GPT-6.1 Terra 加入 OpenAI、Azure OpenAI Responses 与 Codex（Codex 上下文 500K，支持 reasoning `off` 与会话中途改 effort）。
+- **认证**：Anthropic 支持 workload identity federation 与 copy code 登录（device code 事件新增 `openBrowserOnConfirm` / `copyCodeOnConfirm`）；Azure 支持 Foundry Chat Completions 部署；OpenAI 登录允许应用声明自身名称；Radius 提供商目录与 `/login` Radius 登录；Meta（Muse 订阅 OAuth）。
+- **用量与计费**：`Usage.cost.totalFromProvider` 区分 provider 上报的账单总额与目录估算；`AssistantMessage.model` 保留请求模型 ID，服务端返回不同名称时另存 `responseModel`。
+- **重试与限额**：`utils/retry.ts` 将 Cloudflare HTTP 520、Azure 高峰容量、"Selected model is at capacity"、server-busy、Mistral finish_reason 错误纳入可重试；`Retry-After` 无法解析时退回指数退避。OpenRouter 按自身 tokenizer 计输入，输出上限默认留出 15% 估算输入（接近满窗时最多请求 32768），避免过早判定 context overflow。
+- **其他**：`per-thinking-level` 采样参数按思考级别覆盖 temperature/top_p；Bedrock Converse 向 OpenAI 模型发送 reasoning effort；OpenAI Decisions、Cloudflare Clef（Workers AI）、llama.cpp 分类器模型原生支持；请求上下文按 3.5 字符/token 估算。
 
 ### 4.5 工具执行
 
@@ -399,6 +405,8 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 - `setActiveToolsByName()` → `agent.state.tools = [...]` + 重建 `systemPrompt`。
 - 默认工具可配置：`settings.json` 中的 `defaultTools`（`SettingsManager.getDefaultTools()`）覆盖默认的 `[read, bash, edit, write]`，优先级低于 `--tools`/`tools` 选项，且不会移除扩展工具。
 
+工具 Schema：内置工具的 `parameters` 用 `pi-schema` 的 builder（`obj`/`str`/`num` 等）定义，是普通 JSON Schema；`pi-agent-core` 的 `Tool<TParameters>` 用 pi-schema 的 `Static` 推导 `args` 类型。调用前由 `pi-schema` 的 `compile(schema, { coerce: true }).parse()` 校验并强制转换（数字字符串转数字、单值包装为数组等），因此 MCP 等外部提供的纯 JSON Schema 工具获得与内置工具一致的校验与错误文案。TypeBox 不再是 `pi-ai` 的依赖，但仍可作为 schema 的书写方式（其产物就是 JSON Schema）；`Type.Refine()`、`Type.BigInt()`、codec、`Format.Set()` 等非 JSON Schema 特性对工具参数不再生效。
+
 执行流程：
 
 1. LLM 返回 `toolCall` 内容块。
@@ -417,7 +425,7 @@ Provider 生态：`pi-ai` 已内置 OpenAI、Anthropic、Google、Google Vertex�
 | `powershell` | 同 bash（`PowerShellToolInput = BashToolInput`） | 同 bash | 同 bash | 无 | PowerShell 执行（Windows 场景），注入 UTF-8 输出编码前缀，复用 bash 的操作抽象 |
 | `edit` | path/edits[] | 否 | 无 | fileMutationQueue | fuzzy match（NFKC/引号/空白/破折号）、异步 diff 预览 |
 | `write` | path/content | 是（增量高亮） | 无 | fileMutationQueue | 自动创建父目录、流式语法高亮缓存 |
-| `grep` | pattern/path/glob/context/limit | 否 | match limit(100) + 行(500ch) + bytes(50KB) | 无 | 依赖 ripgrep、`.gitignore` 感知 |
+| `grep` | pattern/path/glob/context/limit | 否 | match limit(100) + 行(500ch) + bytes(50KB) | 无 | 依赖 ripgrep、`.gitignore` 感知；context 行由 ripgrep 输出，不再回读匹配文件（避免大文件 OOM，修复 UTF-16 与孤立 CR） |
 | `find` | pattern/path | 否 | 有 | 无 | 文件查找 |
 | `ls` | path | 否 | 有 | 无 | 目录列表 |
 
@@ -556,35 +564,37 @@ Session 文件结构变为：
 
 ### 4.8 会话存储抽象
 
-**背景**：`pi-agent-core` 原有的实验性 harness（`packages/agent/src/harness/`：会话树抽象、`SessionStorage` 接口、JSONL/SQLite 后端、跨会话搜索）已于上游迁出——会话/存储实现进入 `packages/durable`，跨会话搜索（`packages/agent/src/search/`）被移除，`packages/session-backends/sqlite-node` 包随之删除。`packages/agent/docs/harness.md` 规范同样移除，由 `packages/durable/docs/spec.md` 取代。
+**背景**：`pi-agent-core` 原有的实验性 harness（`packages/agent/src/harness/`：会话树抽象、`SessionStorage` 接口、JSONL/SQLite 后端、跨会话搜索）已于上游迁出——会话/存储实现进入 `packages/durable`，跨会话搜索（`packages/agent/src/search/`）被移除，`packages/session-backends/sqlite-node` 包随之删除。`packages/agent/docs/harness.md` 规范由 `packages/durable/docs/spec.md` 取代。**`coding-agent` 不依赖 `pi-durable`**：主 CLI 仍使用自己的 JSONL `SessionManager`，durable 运行时是独立包（实验性 API 不保证兼容）。
 
 **文件**：
 
-- `packages/durable/src/session/`（`session.ts`、`transaction.ts`、`forks.ts`、`observation.ts`）— 事务会话与文档
-- `packages/durable/src/harness/`（`harness.ts`、`agent.ts`、`scheduler.ts`、`inbox.ts`、`submissions.ts`、`task-graph.ts`、`compaction.ts`、`view.ts`、`registry.ts` 等）— durable harness 与任务运行时
-- `packages/durable/src/storage/`（`jsonl/`、`sqlite/`、`memory.ts`、`scan.ts`）— 存储后端
+- `packages/durable/src/session/`（`session.ts`、`writer.ts`、`forks.ts`、`conversation-tails.ts`、`keys.ts`）— 事务会话、写者、fork 与对话尾
+- `packages/durable/src/harness/`（`harness.ts`、`agent.ts`、`scheduler.ts`、`inbox.ts`、`submissions.ts`、`task-graph.ts`、`compaction.ts`、`context.ts`、`provider.ts`、`view.ts`、`registry.ts`、`define.ts` 等）— durable harness 与任务运行时
+- `packages/durable/src/storage/`（`jsonl/`、`sqlite/`、`indexeddb`、`store/`、`memory.ts`、`scan.ts`、`cached-storage.ts`）— 存储后端
 - `packages/durable/src/documents.ts`、`entries.ts`、`tasks.ts`、`images/`、`env/`、`tools/`
 - `packages/durable/docs/spec.md` — 规范（Packages 15–23：首个 chat turn → 生命周期 → 扩展）
-- `packages/coding-agent/src/core/session-manager.ts` — coding-agent 自身的 JSONL 会话管理（与 pi-durable 并行，主 CLI 仍使用）
+- `packages/coding-agent/src/core/session-manager.ts` — coding-agent 自身的 JSONL 会话管理
 
 `pi-durable`（实验性）的核心模型：
 
-1. **先落盘再展示**：会话、模型轮次、工具调用与应用状态先提交存储，进程死亡后重开存储从断点继续（"效果三明治"：intent → 执行 → settlement）。
-2. **事务会话与文档**：版本化文档、fork、checkpoint、迁移；文档状态基于 `chord` 的 operation log/delta；`documentRetentionMs` 按使用度约束文档缓存内存。
-3. **任务运行时（TaskRuntime）**：结构化并发——任务 ownership、等待/完成 holds、自底向上中止、嵌套调用（每个嵌套调用一个文档）、inbox/submissions、task graph 视图；调度器索引只按活跃工作约束内存。
-4. **压缩与溢出**：durable 侧 compaction/overflow（Package 20）。
-5. **其他**：`FileSystem.watch`（Windows 上退化为轮询）、有界二进制/目录读取、图像读取（Photon worker 线程准备）、按 SQL 文本执行并缓存语句的异步 SQLite。
+1. **先落盘再展示**：会话、模型轮次、工具调用与应用状态先提交存储，进程死亡后重开存储从断点继续（"效果三明治"：intent → 执行 → settlement）。死于同一模型请求的进程会记为一次失败尝试并重试，反复杀死进程的请求最终终止。
+2. **事务会话与文档**：版本化文档、fork、checkpoint；文档状态基于 `chord` 的文档与 store；`documentRetentionMs` 按使用度约束文档缓存内存。`/tree` 把主对话的分支实现为 durable fork（会话 fork 时复制文档、尾指针与条目）。
+3. **提交契约（v1.5.0 变更）**：`Storage.commit(batches, receive, context)` 一次提交一组批次，返回 `CommitResult`（`{ stored, refused? }`）；每批是一次带独立 seq 的原子提交，并与前面批次留下的状态核对。Durable 自身规则拒绝的第一个批次及其后内容不落盘，之前的批次保留；其他失败（驱动/IO/COMMIT 错误）整次调用拒绝且不留下可回滚内容。`receive(index, seq)` 在每个批次持久化后按序同步调用。自定义 Storage 需迁移到该签名；`SqliteExecutor` 新增 `runCounted(sql, ...params)`。
+4. **任务运行时（TaskRuntime）**：结构化并发——任务 ownership、等待/完成 holds、自底向上中止、嵌套调用（每个嵌套调用一个文档）、inbox/submissions、task graph 视图；调度器索引只按活跃工作约束内存。
+5. **其他**：`FileSystem.watch`（Windows 上退化为轮询）、有界二进制/目录读取、图像读取（Photon worker 线程准备）、按 SQL 文本执行并缓存语句的异步 SQLite；导出 `./codemode` 与 `./tool-search` 供 harness 内使用。
 
 存储后端：
 
 | 后端 | 实现 | 说明 |
 |------|------|------|
 | JSONL | `packages/durable/src/storage/jsonl/` | Node 端 JSONL 存储 |
-| SQLite | `packages/durable/src/storage/sqlite/` | `node:sqlite` 实现 + Cloudflare Durable Object（`cloudflare.ts`）适配器，含迁移 |
+| SQLite | `packages/durable/src/storage/sqlite/` | `node:sqlite` 实现 + Cloudflare Durable Object 适配器，含迁移 |
+| IndexedDB | `packages/durable/src/storage/indexeddb` | 浏览器环境 |
+| Store | `packages/durable/src/storage/store/` | 基于 Chord store 的 `StoreStorage`（宿主批次内发布） |
 | Memory | `packages/durable/src/storage/memory.ts` | 内存实现，测试用 |
 | 扫描 | `packages/durable/src/storage/scan.ts` | 有界扫描（会话/条目/任务/提交按任意顺序扫描） |
 
-`coding-agent` 主 CLI 当前默认仍使用自己的 JSONL `SessionManager`（`packages/coding-agent/src/core/session-manager.ts`），与 `pi-durable` 的存储抽象并行；`pi-durable` 通过 `coding-agent/src/experimental/durable/`（durable TUI：单进程拥有模型运行时、durable harness、SQLite 存储与 TUI）与 `experimental/vacation/`（示例应用）落地。
+`pi-durable` 通过 `pi-env`（SSH 远程 ExecutionEnv）与 `pi-codemode`（沙箱工具）组合出完整 Agent 形态；存储一致性由 `packages/durable/src/testing/storage-conformance.ts` 与 `env-conformance.ts` 校验。
 
 ### 4.9 Skills、提示模板与扩展系统
 
@@ -652,52 +662,42 @@ Skills：
 
 ---
 
-## 5. Server：durable Session 路由（实验性）
+## 5. pi-schema 与工具参数校验
 
 **文件**：
 
-- `packages/server/src/server.ts` — 路由服务器主体（`ServerHost`、`RoutedServerServiceHost`、`RoutedSessionHandle`）
-- `packages/server/src/session-router.ts` — 会话路由与附件管理
-- `packages/server/src/connection.ts`、`listener.ts` — 连接与监听
-- `packages/server/src/transports/` — 传输实现（`pi-server/unix` 提供 Unix socket）
-- `packages/server/src/errors.ts`、`types.ts`、`index.ts`
+- `packages/schema/src/index.ts` — 公共导出
+- `packages/schema/src/builders.ts` — builder（`obj`、`str`、`num`、`int`、`bool`、`lit`、`oneOf`、`union`、`arr`、`map`、`opt` 等），返回普通 JSON Schema 并携带 `Static` 类型
+- `packages/schema/src/compiler.ts` — 把 schema 编译为闭包
+- `packages/schema/src/validator.ts` — `compile()`、`Validator`、`CoercingValidator`、`ParseResult`
+- `packages/schema/src/coerce.ts` — 强制转换规则（数字字符串、单值→数组、`null`→`"null"` 等）
+- `packages/schema/src/formats/` — 可选导入的格式校验（含 TypeBox 兼容子集）
+- `packages/schema/src/resolver.ts`、`checks.ts`、`explain.ts`、`annotations.ts`、`typebox-static.ts`
+- `packages/schema/src/types.ts` — `JsonSchema`、`ValidationError`、`Check` 等
 
-上游已移除旧的多实例守护进程（`serve`/`spawn`/`rpc-stream` 子命令、`ServerSupervisor`、`instances.json`、Radius 注册）。现在的 `pi-server` 是一个纯库：
+设计要点（v1.5.0 新增，`pi-schema` 零依赖）：
 
-```mermaid
-flowchart TB
-    subgraph Client["外部客户端"]
-        App[应用 / pi-client]
-    end
+1. **不使用 `eval`**：schema 一次编译为普通闭包，在严格 CSP 下同样可用，速度接近代码生成型校验器；压缩后约 8.5 KB，格式校验是可选入口。
+2. **只做 JSON Schema**：支持 draft 2020-12 与 draft 7；不修改 schema，冻结对象可用；错误以 JSON Pointer 路径报告（缺失字段报在字段上）。
+3. **builder 即 JSON Schema**：`obj({ path: str() })` 产出可序列化的 schema，同时用 `Static` 推导出 TypeScript 类型；`obj` 默认封闭对象，`{ open: true }` 允许额外属性。
+4. **校验与强制转换分离**：`compile(schema)` 只校验；`compile(schema, { coerce: true })` 先按 JSON Schema 语义转换再校验，工具调用统一走这条路径。
 
-    subgraph ServerProc["pi-server（宿主进程内）"]
-        Unix[Unix socket listener]
-        Router[Session 路由]
-        SessionDir["SessionDirectory（应用实现）"]
-        SessionMgmt["SessionManagement（应用实现）"]
-    end
+在 pi 中的使用位置：
 
-    subgraph Workers["durable Session worker"]
-        Harness["pi-durable Harness"]
-        Store[(SQLite / JSONL)]
-    end
+| 使用方 | 用途 |
+|--------|------|
+| `pi-agent-core` | `Tool<TParameters>` 的 `args` 类型与运行时参数校验（`validateToolCall` / `validateToolArguments`） |
+| `pi-ai` | 模型与 compat 配置 schema（`providers/model-schema`、`providers/compat-schema`），`Tool.parameters` 接受任意 JSON Schema |
+| `coding-agent` | 内置工具参数；`core/pi-ai-schemas.ts` 把 pi-ai 的 JSON Schema 以 `Type.Unsafe` 转成 TypeBox schema，供自身 settings.json / models.json 的 TypeBox 校验使用 |
+| `chord` | 对象契约（类型、参数、成员）用 builder 描述，运行期校验 |
+| `durable` | 文档、工具、扩展声明与结构化输出的 schema |
 
-    App -->|attach / invokeService| Unix
-    Unix --> Router
-    Router --> SessionDir
-    Router --> SessionMgmt
-    SessionMgmt -->|open routed session| Harness
-    Harness --> Store
-```
+对扩展作者的影响（v1.5.0 破坏性变更）：
 
-职责划分：
-
-1. **应用持有目录与管理**：`SessionDirectory` 把私有会话目录投影为复制后的呈现安全状态；`SessionManagement` 创建、删除、挂载（attach）、卸载会话，路由 ID 不进入业务结果。
-2. **附件路由**：`attachClient()` 建立连接级服务端点；同一连接重复 attach 幂等，每个成功附件有服务器生成的 `attachmentId`（仅作为路由控制数据下发）。会话请求携带 `{serverId, sessionId, attachmentId}`，过期或不匹配的路由被拒绝；连接丢失时拒绝其本地响应，待已受理的服务调用结算后释放附件。
-3. **不透明转发**：`invokeService()` 把不透明的 service/member 信封转发给所选 Session 端点，服务器校验附件路由但不加载 facet 契约、不解码业务负载；订阅更新只发回请求附件。一个会话可有多个呈现附件。
-4. **worker 生命周期**：宿主决定何时在零呈现需求且 worker 内 Harness 空闲时退役 worker；服务器关闭时关闭所有路由 Session 句柄，释放 worker 与 Session 写者所有权。
-
-`coding-agent` 侧的实验接入（`PI_EXPERIMENTAL=1`）：`src/experimental/` 下的 `client.ts`/`client-tui.ts`（实验客户端与 TUI）、`coordinator.ts`、`session-worker-manager.ts`、`server.ts` 与 `radius-relay.ts`（Radius 中继），通过 devDependencies 引入 `pi-client`/`pi-protocol`/`pi-server`。
+- `pi-ai` 主入口不再 re-export `Type` / `Static` / `TSchema`，`typebox` 不再是 `pi-ai` 的依赖。迁移方式：改用 `@earendil-works/pi-schema` 的 `obj`/`str`/`num`，或继续 `import { Type } from "typebox"`（其产物就是 JSON Schema）。
+- 工具参数只按 JSON Schema 校验，以下 TypeBox 特性不再生效：`Type.Refine()` 不执行、`Type.BigInt()`/`Type.Undefined()`/`Type.Void()` 拒绝所有 JSON 值、codec 不解码、`Format.Set()` 注册的格式不检查（标准格式及 `url`、`json-pointer-uri-fragment` 仍检查）、属性名按字面量而非正则匹配。
+- 悬空 `$ref` 只拒绝该位置的参数（`- t: unresolved reference #/definitions/Missing`），不再让整个工具的所有调用失败。
+- 校验失败文案改为 pi-schema 的措辞（`- path: missing`、`- limit: expected number, got string`），MCP 等纯 JSON Schema 工具获得与内置工具相同的强制转换。
 
 ---
 
@@ -741,11 +741,10 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 |------|------|------|
 | Agent 配置目录 | `~/.pi/agent/`（可通过 `PI_CODING_AGENT_DIR` 覆盖） | 所有 coding-agent 数据根目录 |
 | 会话历史（JSONL） | `~/.pi/agent/sessions/<encoded-cwd>/<id>.jsonl` | 树状结构的消息、模型变更、思考级别变更、压缩摘要 |
-| 会话历史（SQLite，实验性） | `<db-path>`（可配置） | `pi-durable` 的 SQLite 存储后端（`node:sqlite` + Cloudflare Durable Object 适配器），服务实验性 durable harness |
+| 会话历史（SQLite，实验性） | `<db-path>`（可配置） | `pi-durable` 的 SQLite 存储后端（`node:sqlite` + Cloudflare Durable Object 适配器）；durable 另有 IndexedDB、Chord store、JSONL 与内存后端 |
 | 设置 | `~/.pi/agent/settings.json` | 用户偏好、模型、Provider 凭证引用 |
 | 凭证 | 系统密钥存储 / `~/.pi/agent/credentials` | API key / OAuth token（由 `CredentialStore` 抽象） |
 | 模型缓存 | `~/.pi/agent/models.json` | 各 Provider 的动态模型列表缓存 |
-| Server Unix socket（实验性） | 由 `pi-server/unix` 的 `getUnixSocketPath()` 决定 | 实验路由服务器监听地址 |
 
 会话条目类型（`SessionTreeEntry`）：
 
@@ -764,19 +763,6 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 
 ## 8. 关键文件索引
 
-### Server（实验性）
-
-| 文件 | 职责 |
-|------|------|
-| `packages/server/src/server.ts` | 路由服务器主体（`ServerHost`、`RoutedServerServiceHost`、`RoutedSessionHandle`） |
-| `packages/server/src/session-router.ts` | 会话路由与附件管理 |
-| `packages/server/src/connection.ts` | 连接生命周期 |
-| `packages/server/src/listener.ts` | 监听器 |
-| `packages/server/src/transports/` | 传输实现（`pi-server/unix` 导出 Unix socket） |
-| `packages/server/src/errors.ts` | 错误类型（`SessionNotFoundError` 等） |
-| `packages/server/src/types.ts` | 路由/附件类型 |
-| `packages/server/src/index.ts` | server 公共导出 |
-
 ### Coding Agent
 
 | 文件 | 职责 |
@@ -786,7 +772,7 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/sdk.ts` | 程序化 SDK：`createAgentSession()` |
 | `packages/coding-agent/src/core/agent-session-services.ts` | 按 cwd 构建服务 |
 | `packages/coding-agent/src/core/agent-session-runtime.ts` | 运行时与会话切换 |
-| `packages/coding-agent/src/core/agent-session.ts` | 核心会话抽象与事件流（~4400行） |
+| `packages/coding-agent/src/core/agent-session.ts` | 核心会话抽象与事件流（~4500行） |
 | `packages/coding-agent/src/core/session-manager.ts` | JSONL 会话管理 |
 | `packages/coding-agent/src/core/model-runtime.ts` | 模型运行时与调度 |
 | `packages/coding-agent/src/core/model-resolver.ts` | 模型字符串解析 |
@@ -798,7 +784,8 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/coding-agent/src/utils/management-http.ts` | `fetchWithRetry`：整体时间预算 + 每次尝试超时 |
 | `packages/coding-agent/src/utils/pi-user-agent.ts` | pi User-Agent 构造（模型目录/管理请求） |
 | `packages/coding-agent/src/core/provider-composer.ts` | Provider 组合（扩展自定义 provider/OAuth 配置） |
-| `packages/coding-agent/src/core/provider-attribution.ts` | Provider 归属跟踪 |
+| `packages/coding-agent/src/core/pi-ai-schemas.ts` | 把 pi-ai 的 pi-schema 配置 schema 转成 TypeBox schema，供 settings.json / models.json 校验 |
+| `packages/coding-agent/src/core/virtual-models.ts` | 虚拟模型定义（provider 别名路由） |
 | `packages/coding-agent/src/core/settings-manager.ts` | 用户设置读写 |
 | `packages/coding-agent/src/core/settings-defaults.ts` | 设置默认值（`tuiMode: "fullscreen"` 等） |
 | `packages/coding-agent/src/core/settings-schema.ts` | 设置 schema（随配置 schema 发布） |
@@ -858,7 +845,7 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/coding-agent/src/core/slash-commands.ts` | slash 命令解析与分发 |
 | `packages/coding-agent/src/core/export-html/index.ts` | 会话 HTML 导出 |
 | `packages/coding-agent/src/modes/print-mode.ts` | 一次性文本/JSON 模式 |
-| `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | 交互式 TUI 模式（~7100行，默认全屏布局） |
+| `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | 交互式 TUI 模式（~7200行，默认全屏布局） |
 | `packages/coding-agent/src/modes/rpc/` | RPC 模式 |
 | `packages/coding-agent/src/rpc-entry.ts` | server 子进程 RPC 入口 |
 | `packages/coding-agent/src/bun/cli.ts` | Bun 二进制入口包装 |
@@ -867,8 +854,8 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 
 | 文件 | 职责 |
 |------|------|
-| `packages/agent/src/agent.ts` | 有状态 Agent 包装器（~610行） |
-| `packages/agent/src/agent-loop.ts` | 多轮 LLM/工具循环（~950行） |
+| `packages/agent/src/agent.ts` | 有状态 Agent 包装器（~620行） |
+| `packages/agent/src/agent-loop.ts` | 多轮 LLM/工具循环（~960行） |
 | `packages/agent/src/types.ts` | 核心类型 |
 | `packages/agent/src/stream-fn.ts` | 默认流函数 |
 | `packages/agent/src/proxy.ts` | Agent 代理 |
@@ -936,29 +923,18 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/tui/src/terminal-image.ts` | 终端图片渲染 |
 | `packages/tui/src/native-modifiers.ts`、`native-platform.ts` | 原生修饰键检测 |
 
-### Protocol (线协议)
+### Schema (pi-schema)
 
 | 文件 | 职责 |
 |------|------|
-| `packages/protocol/src/cbor/encoder.ts` | CBOR 编码器 |
-| `packages/protocol/src/cbor/decoder.ts` | CBOR 解码器 |
-| `packages/protocol/src/cbor/options.ts` | CBOR 选项 |
-| `packages/protocol/src/framing.ts` | 字节流 framing（4 字节长度前缀 + CBOR 项） |
-| `packages/protocol/src/protocol.ts` | 消息 schema（hello、request/response、event 信封） |
-| `packages/protocol/src/codec.ts` | 客户端/服务端消息编解码与校验 |
-| `packages/protocol/src/index.ts` | 公共导出 |
-
-### Client (远程会话客户端)
-
-| 文件 | 职责 |
-|------|------|
-| `packages/client/src/client.ts` | `PiClient`：连接、会话管理、快照订阅 |
-| `packages/client/src/connection.ts` | 连接生命周期与重连 |
-| `packages/client/src/transport.ts` | `ByteTransport` 接口 |
-| `packages/client/src/unix.ts` | Unix socket 传输 |
-| `packages/client/src/promise.ts` | Promise 辅助 |
-| `packages/client/src/errors.ts` | 错误类型 |
-| `packages/client/src/types.ts` | 客户端类型 |
+| `packages/schema/src/builders.ts` | builder：`obj`/`str`/`num`/`int`/`bool`/`lit`/`oneOf`/`union`/`arr`/`map`/`opt`，返回普通 JSON Schema |
+| `packages/schema/src/compiler.ts` | 把 schema 编译为闭包（无 eval） |
+| `packages/schema/src/validator.ts` | `compile()`、`Validator`、`CoercingValidator`、`ParseResult` |
+| `packages/schema/src/coerce.ts` | 强制转换规则（数字字符串、单值→数组等） |
+| `packages/schema/src/formats/` | 可选格式校验（含 TypeBox 兼容子集） |
+| `packages/schema/src/resolver.ts` | `$ref` / `$defs` 解析 |
+| `packages/schema/src/explain.ts` | 校验错误文案 |
+| `packages/schema/src/typebox-static.ts` | TypeBox `Static` 兼容类型 |
 
 ### Durable（实验性持久运行时）
 
@@ -970,13 +946,15 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/durable/src/harness/task-graph.ts` | 任务图视图 |
 | `packages/durable/src/harness/compaction.ts` | durable 压缩与溢出 |
 | `packages/durable/src/session/session.ts` | 事务会话（`documentRetentionMs` 约束文档缓存） |
-| `packages/durable/src/session/transaction.ts`、`forks.ts` | 事务与文档 fork |
+| `packages/durable/src/session/writer.ts`、`forks.ts`、`conversation-tails.ts` | 会话写者、fork、对话尾 |
+| `packages/durable/src/storage/indexeddb`、`storage/store/` | 浏览器 IndexedDB 与 Chord store 后端 |
 | `packages/durable/src/documents.ts` | 版本化文档（chord 状态） |
 | `packages/durable/src/storage/jsonl/` | JSONL 存储后端 |
 | `packages/durable/src/storage/sqlite/` | SQLite 后端（`node.ts`：node:sqlite；`cloudflare.ts`：Durable Object） |
 | `packages/durable/src/storage/scan.ts` | 有界扫描（会话/条目/任务/提交） |
 | `packages/durable/src/images/` | 图像处理（`node-worker.ts` worker 线程准备） |
 | `packages/durable/src/env/` | ExecutionEnv 抽象（配合 pi-env） |
+| `packages/durable/src/testing/` | 存储与 env 一致性测试套件 |
 | `packages/durable/docs/spec.md` | 规范（Packages 15–23） |
 
 ### Codemode / MCP / Env / Chord
@@ -991,18 +969,26 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 | `packages/mcp/src/oauth/` | OAuth 授权（动态客户端注册、RFC 9207） |
 | `packages/env/src/remote-env.ts` | 远程 ExecutionEnv 客户端 |
 | `packages/env/src/connection.ts` | SSH 连接与守护进程部署 |
-| `packages/chord/src/api.ts` | 组合运行时 API（服务、复制状态、RPC） |
-| `packages/chord/src/delta/` | 不可变 delta 引擎（operation log） |
-| `packages/chord/src/facets/`、`services/` | facet 与服务组合 |
-| `packages/chord/src/node/bundle.ts` | 插件打包（esbuild） |
+| `packages/chord/src/api.ts`（`index.ts`） | 对象运行时 API（契约、引用、文档、链接） |
+| `packages/chord/src/contracts/`、`host/` | 契约与 host 管理 |
+| `packages/chord/src/documents/`、`store/`、`state/` | 文档、store 与状态（事务、导出/导入） |
+| `packages/chord/src/registries/`、`jobs/` | registry 与 job |
+| `packages/chord/src/http/` | `chord/http`：Web 标准 fetch handler、认证、Node 监听器 |
+| `packages/chord/src/workers/` | `chord/workers`：按 host 地址派生 worker、`processLock` |
+| `packages/chord/src/plugins/` | `chord/plugins`：发现、用 esbuild 构建、热重载、rollout |
+| `packages/chord/src/app/`、`surfaces/`、`web/`、`tui/` | `chord/app`、`chord/surfaces`、`chord/web`、`chord/tui`：服务器/worker 启动与 Web/终端 surface |
+| `packages/chord/src/telemetry.ts`、`telemetry-ingest/`、`telemetry-sqlite/` | span 与指标接入 pi-telemetry，服务端聚合并存储 |
 
 ### Telemetry (遥测)
 
 | 文件 | 职责 |
 |------|------|
-| `packages/telemetry/src/index.ts` | 遥测公共导出 |
+| `packages/telemetry/src/index.ts` | 契约：span、属性、传播载体、上下文、指标定义 |
+| `packages/telemetry/src/metrics.ts` | 指标类型与辅助 |
 | `packages/telemetry/src/memory.ts` | 内存遥测实现 |
 | `packages/telemetry/src/noop.ts` | noop 遥测实现 |
+| `packages/telemetry/src/render.ts` | span 树渲染（`pi-telemetry/render`） |
+| `packages/telemetry/src/testing/` | 测试辅助 |
 
 ### Evals
 
@@ -1023,16 +1009,16 @@ npm run eval:docs -w packages/evals -- --provider <provider> --model <model>
 
 Pi 的架构呈现清晰的纵向分层：
 
-1. **入口层**（CLI / Bun 二进制）负责启动和外部连接。
-2. **应用层**（`coding-agent`）承载产品级语义：会话、扩展、工具、配置、UI、Skills、导出、模型解析、信任与认证；能力面通过 `codemode`（沙箱脚本）与 `mcp`（MCP 服务器）扩展。
-3. **运行时层**（`agent-core`）提供与产品无关的 Agent 多轮循环与状态管理（持久化与 harness 已移出）。
-4. **持久运行时层**（`durable`，实验性）承载"先落盘再展示"的会话/文档/任务运行时，配套 `env`（SSH 远程执行）与 `chord`（文档状态、组合运行时）。
-5. **LLM 层**（`ai`）将多提供商差异收敛为统一的消息/事件/认证模型，支持图像生成与多种 OAuth 流程。
+1. **入口层**（CLI / Bun 二进制 / RPC 入口）负责启动和外部连接。
+2. **应用层**（`coding-agent`）承载产品级语义：会话、扩展、工具、配置、UI、Skills、导出、模型解析、信任与认证；能力面通过内置扩展接入 `codemode`（沙箱脚本）与 `mcp`（MCP 服务器）。其运行时依赖树只有 `agent-core`、`ai`、`codemode`、`mcp`、`tui`，不引入 chord/durable/env。
+3. **运行时层**（`agent-core`）提供与产品无关的 Agent 多轮循环、状态管理与工具参数校验（校验由 `pi-schema` 完成）。
+4. **持久运行时层**（`durable`，实验性）是独立包：承载"先落盘再展示"的会话/文档/任务运行时，配套 `env`（SSH 远程执行）与 `chord`（对象运行时、文档 store、插件热重载）。当前 CLI 不依赖它，API 随版本变化。
+5. **LLM 层**（`ai`）将多提供商差异收敛为统一的消息/事件/认证模型，支持图像生成、消息线程与多种 OAuth 流程。
 6. **UI 层**（`tui`）提供高效差分渲染的终端组件系统（默认全屏布局），支持图片、原生修饰键、自动补全等编辑器增强。
-7. **线协议/客户端/服务器层**（`protocol`/`client`/`server`）为远程 durable Session 提供二进制消息协议、传输无关客户端与路由服务器；**遥测层**（`telemetry`）提供可插拔观测。
+7. **契约层**（`schema`/`telemetry`）提供所有上层共用的 JSON Schema 校验（无 eval）与厂商中立的 span/指标契约。
 8. **评测层**（`evals`）对 coding-agent 进行端到端行为评测。
 9. **示例扩展层**（`packages/coding-agent/examples/extensions/*`）展示如何扩展 Provider、UI 与沙箱。
 
-**实验性 durable 方向**：`pi-durable`（规范见 `packages/durable/docs/spec.md`）是新一代持久 Agent 运行时——事务会话/文档/任务、结构化并发（ownership、自底向上中止）、压缩与溢出、watch，存储后端 JSONL/SQLite（`node:sqlite` 与 Cloudflare Durable Object 适配器）；`coding-agent/src/experimental/` 已在其上实现 durable TUI、实验客户端/服务器与示例应用。主线 `coding-agent` 仍使用自身的 JSONL `SessionManager` 与 `AgentSession`。
+**版本演进要点**：v1.2.0 移除了实验性的 `server`/`client`/`protocol` 与实验客户端栈；v1.5.0 新增 `pi-schema` 并让工具参数校验完全走 JSON Schema（`typebox` 不再是 `pi-ai` 依赖，也不再 re-export），这是扩展作者需要迁移的主要破坏性变更。
 
-核心控制流是：用户输入 → `AgentSession.prompt()` → `Agent` 循环 → `Models.stream()` → 上游 LLM → 流式事件 → 工具执行 → 事件持久化 → UI/stdout 渲染。扩展和钩子机制贯穿整个流程，允许在输入、LLM 请求、工具调用、输出渲染等节点注入自定义行为。
+核心控制流是：用户输入 → `AgentSession.prompt()` → `Agent` 循环 → `Models.stream()` → 上游 LLM → 流式事件 → 工具执行（pi-schema 校验参数）→ 事件持久化 → UI/stdout 渲染。扩展和钩子机制贯穿整个流程，允许在输入、LLM 请求、工具调用、输出渲染等节点注入自定义行为。

@@ -1,11 +1,11 @@
 # Pi → QNX 8.0 移植可行性分析
 
-> 分析日期：2026-08（基于 GitHub 公开仓库证据）；代码增量核对至 2026-10-11，上游 `e6b9a6af5`（v1.1.0 后）。外部 QNX 运行时与工具链结论未在本轮重新验证。
+> 分析日期：2026-08（基于 GitHub 公开仓库证据）；代码增量核对至 2026-11-04，上游 `e88525506`（v1.5.0）。外部 QNX 运行时与工具链结论未在本轮重新验证。
 > 范围：将 pi monorepo（`packages/coding-agent` 主 CLI/SDK）移植到 QNX Neutrino 8.0（x86_64 与 aarch64le 均适用）
 
 ## 结论
 
-**可行**。核心阻塞（Node.js 运行时）已被 QNX 官方解决：QNX 8.0 通过 apk 提供 Node.js 24.14.1 LTS。主要剩余工作量为 ripgrep/fd 两个外部工具的 QNX 构建、规避 esbuild 的 postinstall（安装加 `--ignore-scripts`），以及实际冒烟验证。
+**可行**。核心阻塞（Node.js 运行时）已被 QNX 官方解决：QNX 8.0 通过 apk 提供 Node.js 24.14.1 LTS。v1.5.0 起 coding-agent 不再依赖 `chord`，其安装路径中已没有 esbuild（随包 install-lock 中 0 处 esbuild/chord），普通 `npm install` 即可完成安装，**不再需要 `--ignore-scripts`**。主要剩余工作量为 ripgrep/fd 两个外部工具的 QNX 构建，以及实际冒烟验证。
 
 ### 架构支持（aarch64le）
 
@@ -57,7 +57,8 @@
 |----|------|------|
 | 运行时 | ✅ | Node 24.14.1 LTS ≥ pi 要求 `>=22.19.0`；`node:sqlite`、`worker_threads`、`AbortSignal.any/timeout`、UDS (`AF_UNIX`)、信号/进程组均可用 |
 | `process.platform` | ✅ 有利 | 返回 `"qnx"` → pi 的 win32/linux 分支都不误命中；`package-manager.ts` 的 `/proc/self/environ` 读取、footer-data-provider 的 WSL 检测等 `platform === "linux"` 门控逻辑被跳过 |
-| npm 安装 | ⚠️ 需 `--ignore-scripts` | Node 分发为 esbuild 单文件 bundle（bin → `dist/bundle/cli.js`，纯 ESM）；多数依赖纯 JS + WASM（`@silvia-odwyer/photon-node`、`quickjs-wasi` 是 WASM，`typebox` 纯 JS，lockfile 均无 install script；剪贴板/修饰键原生能力由 `@earendil-works/pi-tui` 随包预编译 `.node` 提供，仅 darwin/win32/linux-X11，安装不编译）。上游已移除 npm shrinkwrap 并推荐 managed installer，npm 分发本身不变。新版 `@earendil-works/chord` 依赖 `esbuild`（带 postinstall，无 qnx 平台包）→ QNX 上直接 `npm install` 会因 esbuild postinstall 抛 `Unsupported platform: qnx ...` 失败，需 `npm install --ignore-scripts`（见下文 esbuild 缺口） |
+| npm 安装 | ✅ | v1.5.0 的运行时依赖树只有 `pi-agent-core`、`pi-ai`、`pi-codemode`、`pi-mcp`、`pi-tui` 及纯 JS/WASM 包（`quickjs-wasi`、`@silvia-odwyer/photon-node`、`typebox`、`marked`、`lovely-mermaid`、`cross-spawn` 等）；随包 `install-lock` 共 123 项，**无 esbuild、无 chord**。仍带 install script 的只有 `@google/genai`（`preinstall: echo 'preinstall: no-op'`，`prepare` 只在 git 依赖时运行）与 `protobufjs`（postinstall 打印赞助信息）——均为纯 JS，QNX 可执行，不阻塞安装。`pi-tui` 的剪贴板/修饰键原生 helper 以预编译 `.node` 随包分发（`native/{darwin,win32,linux}/prebuilds`），不是依赖也不在安装期编译。`--ignore-scripts` 仍可用作加固，但不再是必需 |
+| 工具参数校验 | ✅ | v1.5.0 起工具参数由 `pi-schema` 校验：零依赖、不使用 `eval`，schema 编译为普通闭包；无 JIT/CSP 特权要求，QNX 上无额外依赖（`typebox` 仍作为 coding-agent 依赖保留，用于配置 schema） |
 | bash 工具 | ✅ | aports 有 bash 5.3；`shell.ts` 路径 `/bin/bash` → PATH bash → `sh` 兜底成立 |
 | git | ✅ | aports 有 git；footer 分支显示可用 |
 | grep 工具 | ❌ 硬缺口 | 需要 `rg`；pi 的自动下载（`tools-manager.ts`）只支持 darwin/linux/win32 资产 |
@@ -100,21 +101,17 @@
 
 注意：若 `process.platform === "qnx"`，`getAssetName()` 对未知平台返回 `null` → 自动下载被跳过，不会误下载 linux 二进制（`ensureTool()` 捕获后仅给出 warning，grep/find 功能降级不崩溃）。离线 QNX 环境可设 `PI_OFFLINE=1` 直接跳过下载尝试，避免每工具最长 120s 的网络超时。
 
-### esbuild（仅 experimental 功能受影响）
+### esbuild（v1.5.0 起不再是安装阻塞）
 
-- coding-agent 自 0.85.1 起依赖 `@earendil-works/chord`，chord 又依赖 `esbuild`（用在 `packages/chord/src/node/bundle.ts`，即 `chord/bundler`、`chord/node` 入口）
-- esbuild 0.28.2 带 postinstall（`hasInstallScript: true`），其 `install.js` 按 `process.platform + arch + endianness` 查平台包表；`qnx arm64 LE` / `qnx x64 LE` 不在 `knownUnixlikePackages` 中 → 直接抛 `Unsupported platform: qnx arm64 LE`，导致整个 `npm install` 失败
-- 稳定 `pi` CLI 不加载 chord/esbuild：Node bundle 中 `@earendil-works/chord` 为 external，且只有 `src/experimental/**`（`PI_EXPERIMENTAL=1` 的插件打包 `bundleFacetPackage`、服务模式）会静态 import esbuild
-- 2026-10-11 复核：coding-agent 新增 `pi-codemode`/`pi-mcp` 运行时依赖（`quickjs-wasi`、`cross-spawn`、`typebox` 等，lockfile 均无 install script），esbuild 仍仅经 chord 传递，`src/node/bundle.ts` 路径未变，上述结论不变
-- 解决：
-  1. **安装加 `--ignore-scripts`**（推荐）：跳过 esbuild 的 postinstall，稳定 CLI 不受影响
-  2. 若需 experimental 插件打包：esbuild 是 Go 程序，可交叉编译到 QNX，再用 `ESBUILD_BINARY_PATH` 指向该二进制（esbuild 的 install.js 与运行时的 JS API 均支持该环境变量覆盖）
+- v1.1 及之前：`coding-agent` → `chord` → `esbuild`（带 postinstall），esbuild 的 `install.js` 按 `process.platform + arch + endianness` 查平台包表，`qnx arm64 LE` / `qnx x64 LE` 不在表中 → 抛 `Unsupported platform: qnx ...`，导致整个 `npm install` 失败，必须加 `--ignore-scripts`。
+- v1.2.0 起（核对至 v1.5.0）：`coding-agent` 不再依赖 `chord`。chord 只被 `pi-durable` 使用，且把 `esbuild` 声明为**可选 peerDependency**（仅 `chord/plugins` 构建插件时加载），不再是普通依赖。随包 `packages/coding-agent/install-lock/package-lock.json` 中 esbuild、chord 均为 0 处。
+- 因此 QNX 上 `npm install -g @earendil-works/pi-coding-agent` 直接可用。只有两种情况仍需要 esbuild：从源码开发 monorepo（根 `devDependencies`），或使用 `chord/plugins` 构建插件——此时可交叉编译 Go 版 esbuild，并用 `ESBUILD_BINARY_PATH` 指向该二进制（esbuild 的 install.js 与运行时 JS API 都支持该变量）。
 
 ## 落地步骤
 
 1. QNX 8.0 配置 apk 源，`sudo apk add nodejs npm bash git`
 2. 准备 rg/fd（交叉编译或 aports PR）
-3. `npm install -g @earendil-works/pi-coding-agent --ignore-scripts`（见 esbuild 缺口）→ `pi --version` 冒烟
+3. `npm install -g @earendil-works/pi-coding-agent`（v1.5.0 起无需 `--ignore-scripts`）→ `pi --version` 冒烟
 4. 先跑 headless（`pi -p "..."`），再在 SSH 终端验证交互模式
 5. 处理 OAuth（无浏览器时验证 device code 流程）
 6. 可选用 Node 分发版（`dist/bundle/cli.js`，npm `pi` bin 入口）而非 Bun 二进制
@@ -132,9 +129,9 @@
 - 初次分析（未搜索 GitHub 前）曾判断"Node 需自行移植、整体不建议"，该结论已被官方 aports 证据推翻，本文档为修正版。
 - Bun 二进制分发版不适用 QNX（Bun 未移植），使用 Node 分发。
 
-## 上游更新记录（0.85.1 → 2026-10-11）
+## 上游更新记录（0.85.1 → 2026-11-04）
 
-截至 2026-09-15 的上一轮记录：`v0.85.1`（2026-09-05 发布）之后有约 97 个未发布提交（版本号仍为 0.85.1），与 QNX 部署相关的要点如下；2026-09-17 与 2026-10-11 增量另列于后文。
+截至 2026-09-15 的上一轮记录：`v0.85.1`（2026-09-05 发布）之后有约 97 个未发布提交（版本号仍为 0.85.1），与 QNX 部署相关的要点如下；2026-09-17、2026-10-11 与 2026-11-04 增量另列于后文。
 
 ### 性能
 
@@ -171,7 +168,7 @@
 
 - `pi-agent-core` 移除实验性 harness（会话树、`SessionStorage`、JSONL/SQLite 后端、跨会话搜索）；`packages/session-backends/sqlite-node` 包删除，SQLite 存储进入实验性 `pi-durable`（`packages/durable/src/storage/sqlite/`，`node:sqlite`）。
 - coding-agent 新增运行时依赖 `pi-codemode`（quickjs-wasi 沙箱脚本工具）与 `pi-mcp`（MCP 客户端）；`pi-durable`、`pi-env`（SSH 远程执行）为独立/实验包，不进入稳定 CLI 依赖树。
-- 新依赖均为纯 JS/WASM（lockfile 无 install script），esbuild 仍仅经 `chord` 传递——`--ignore-scripts` 结论不变（见上文 esbuild 缺口）。
+- 新依赖均为纯 JS/WASM（lockfile 无 install script），esbuild 仍仅经 `chord` 传递——`--ignore-scripts` 结论不变（见上文 esbuild 缺口）。**该结论已被 2026-11-04 的 v1.5.0 核对推翻**：coding-agent 不再依赖 chord，安装无需 `--ignore-scripts`。
 - npm shrinkwrap 移除，上游推荐 managed installer；npm 分发仍为 Node esbuild 单文件 bundle，安装方式不变。
 
 **平台相关行为**
@@ -185,3 +182,37 @@
 **OAuth（无浏览器场景）**
 
 - 新增 Anthropic copy-code 登录（#10194）、workload identity federation（#10242）、MCP 服务器 OAuth（动态客户端注册、RFC 9207 `iss` 校验、step-up 授权、按服务器存储凭证）；无浏览器时仍以 device code 流程为主，逐 provider 验证的注意事项不变。
+
+### 2026-11-04 增量核对（`e6b9a6af5` → `e88525506`，v1.1.0 → v1.5.0）
+
+本轮合并约 650 个上游提交，覆盖 v1.2.0、v1.3.0、v1.4.0、v1.5.0 四个发布。**esbuild 安装阻塞已消除**，其余 QNX 结论不变。
+
+**关键变化：安装不再需要 `--ignore-scripts`**
+
+- `coding-agent` 不再依赖 `chord`：运行时依赖仅 `pi-agent-core`、`pi-ai`、`pi-codemode`、`pi-mcp`、`pi-tui` 加纯 JS/WASM 包。
+- 随包 `install-lock`（123 项）中 esbuild、chord 均为 0 处；esbuild 现在只是 monorepo 的 devDependency 与 `chord` 的可选 peerDependency（仅 `chord/plugins` 构建插件时使用）。
+- 仍带 install script 的两个包都是无害 JS：`@google/genai`（preinstall 为 `echo` no-op）、`protobufjs`（postinstall 打印赞助信息）。
+- `pi-tui` 的原生 helper 仍以预编译 `.node` 随包分发（darwin/win32/linux），安装期不编译，QNX 上加载失败后降级。
+
+**包结构与应用层**
+
+- v1.2.0 删除实验性 `packages/server`、`packages/client`、`packages/protocol` 及 `coding-agent/src/experimental` 的客户端/服务器栈；CLI 不再涉及 Unix socket 服务与 CBOR 线协议。
+- v1.5.0 新增 `packages/schema`（`pi-schema`）：零依赖、不使用 `eval` 的 JSON Schema 校验器，工具参数统一由它校验。对 QNX 无额外要求（纯 JS 闭包，无 JIT 假设）。
+- 破坏性变更（影响扩展作者，不影响 QNX）：`pi-ai` 不再 re-export TypeBox，`typebox` 不再是 `pi-ai` 依赖；`Type.Refine()`、`Type.BigInt()`、codec、`Format.Set()` 等非 JSON Schema 特性对工具参数不再生效。`typebox` 仍是 `coding-agent` 自身配置 schema 的依赖。
+
+**平台相关行为**
+
+- 工具下载门控未变：`tools-manager.ts` 的 `getReleaseTarget()` 只映射 darwin/linux/win32，`process.platform === "qnx"` 时返回 undefined → 跳过自动下载并提示用系统包管理器安装；rg/fd 放入 PATH 即可（`PI_OFFLINE=1` 可避免超时）。
+- 剪贴板新增 Termux、WSL（`clip.exe` 文件中转）与 OSC 52 强制开关（`PI_CLIPBOARD_OSC52=1`）；QNX 路径不变——SSH 会话走 OSC 52，本地控制台读取返回 null、写入抛 `Clipboard unavailable`。
+- 修饰键 native helper 平台门控仍为 darwin/win32；QNX 上 `isNativeModifierPressed` 恒 false，降级不崩溃。
+- TUI 全屏默认（`tuiMode: "fullscreen"`）不变；`pi-tui` 依赖改为 `marked`、`marked-cjk-friendly`、`get-east-asian-width`，均为纯 JS。
+- grep 工具改为由 ripgrep 直接输出 context 行，不再回读匹配文件（#9276）——QNX 上大文件匹配的内存压力降低。
+- 图像处理新增 worker 线程准备路径（Photon WASM），Node 24 的 `worker_threads` 可用。
+- Node 引擎要求仍为 `>=22.19.0`，QNX apk 的 Node 24.14.1 满足。
+
+**其他（与 QNX 无关，但在同一批提交中）**
+
+- Anthropic 消息线程（message threads beta，只发增量消息）、GPT-6.1 Terra、Qwen Token Plan Individual CN provider、`Usage.cost.totalFromProvider`、models.dev v2 模型目录。
+- `pi-durable` 的 `Storage.commit()` 改为批量契约（`commit(batches, receive, context)`），`/tree` 分支实现为 durable fork——只影响实验包，不在 CLI 运行时路径上。
+
+> 注：本轮同样只核对代码与文档，未在 QNX 设备上执行冒烟验证。安装方式的结论来自 `packages/coding-agent/install-lock/package-lock.json` 与各包 `package.json`，不是实机结果。
